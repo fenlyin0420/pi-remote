@@ -1,0 +1,708 @@
+# Remote Pi — Protocol & Security
+
+Documentação canônica do protocolo Remote Pi e do modelo de proteção.
+Atualizada em 2026-07-18.
+
+---
+
+## Visão de 30 segundos
+
+- **Mesh de agentes coding** rodando em múltiplos PCs do mesmo usuário
+- **Cada PC** roda o `pi-remote` (Node.js daemon) com **uma Pi-key** Ed25519 no Keychain do sistema (macOS/Linux/Windows)
+- **Celular** é o **autenticador inicial** (estilo WhatsApp Web QR) — depois do pareamento, PCs operam autonomamente entre si
+- **Owner-key** Ed25519 vive no Keychain do celular (iOS Keychain / Android Block Store), sincroniza entre devices do mesmo Apple ID / Google Account
+- **Relay** WebSocket roteia e armazena/verifica `mesh_versions` assinadas pelo Owner; autoriza co-membership direta
+- **Cross-PC routing** por Pi-key canônica no Relay; a Extension `0.6` mantém por uma release o prefixo wire legado para interoperar com Extensions antigas, sem substituir aliases receiver-local públicos
+
+---
+
+## Identidades
+
+| Chave | Algoritmo | Onde mora | Quem cria | Quem usa |
+|---|---|---|---|---|
+| **Owner-key** | Ed25519 | iOS Keychain (sync iCloud) / Android Block Store (sync Google) | App mobile no 1º boot | Assina `mesh_versions`, prova autoridade pra parear/revogar PCs |
+| **Pi-key** | Ed25519 | `@napi-rs/keyring` no PC (Keychain macOS / libsecret Linux / Credential Manager Windows). Fallback `~/.pi/remote/identity.json` (`0600`) com warning em sistemas headless | pi-remote no 1º boot | Autentica a conexão WS no relay e fornece a identidade técnica canônica usada no `from_pc` autenticado e no roteamento por `to_pc`; não assina envelopes cross-PC individuais |
+| **App-key** | Ed25519 efêmera | RAM do app mobile | App por sessão de pareamento | Establishment de canal autenticado durante pair |
+
+**Identidade técnica** de cada Pi/PC é a chave pública Ed25519 bruta de 32 bytes. Nas fronteiras do protocolo, Pi-key e Owner-key usam Base64 RFC 4648 padrão **com padding** como representação canônica; entradas URL-safe ou sem padding podem ser aceitas apenas para normalização. Nicknames e aliases locais efetivos nunca substituem essa identidade técnica.
+
+**Constraint fixada**: "1 Pi-key por PC; troca de hardware = re-pareamento". Não há migração de Pi-key entre máquinas. Owner-key compensa (Owner sincroniza cross-device via Keychain do sistema).
+
+---
+
+## Camadas do protocolo
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  Agent layer       Pi coding agent (futuro: Claude Code, OpenCode)  │
+├─────────────────────────────────────────────────────────────────────┤
+│  Envelope          {from, to, id, re, body}  — JSONL 5 campos       │
+├─────────────────────────────────────────────────────────────────────┤
+│  Routing           Local UDS broker  /  Cross-PC via relay forward  │
+│                    Público [<alias-local-do-receptor>:]<cwd>@<agent>│
+│                    Local <cwd>@<agent>; `broker` reservado          │
+├─────────────────────────────────────────────────────────────────────┤
+│  ACK protocol      received | busy | denied | timeout               │
+│                    Broker/BrokerRemote gera ACK sem LLM             │
+├─────────────────────────────────────────────────────────────────────┤
+│  Transport         UDS (local)  /  WebSocket sobre TLS (relay)      │
+├─────────────────────────────────────────────────────────────────────┤
+│  Trust             Ed25519 challenge-response                       │
+│                    Owner-sig em mesh_versions                       │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Envelope
+
+Formato único pra todo o sistema. Funciona local (UDS) e cross-PC (relay forward).
+
+```text
+{
+  "from": "<sender-name>",
+  "to": "<recipient-name>" | ["<r1>", "<r2>"] | "broadcast",
+  "id": "<UUID v7 normal gerado pela Extension>",
+  "re": "<id-of-message-being-replied-to>" | null,
+  "body": <any JSON>
+}
+```
+
+Naming:
+- **Local**: `<cwd>@<agent>`; `broker` é um endereço local reservado.
+- **Endereço público**: `[<alias-local-do-receptor>:]<cwd>@<agent>`; o alias é apresentação/roteamento local ao receptor, não identidade estável nem alegação do remetente.
+- Cada byte UTF-8 fora de `[A-Za-z0-9._-]` no nickname vira `%HH` literal em maiúsculas. Assim `:`, `%`, `~`, espaços, controles e Unicode nunca aparecem crus; `~<prefixo-base64url-da-chave>` é reservado para resolver colisões.
+- Para cada chave canônica, coletam-se candidatos de nickname não vazios das contribuições Owner diretas e escolhe-se o menor já codificado em ASCII; em empate, vence o menor UTF-8 bruto. Ausente/vazio usa `pc-<prefixo-base64url-da-chave-canônica>` com prefixo inicial de 8 caracteres. Reservam-se todas as bases e, em colisões, cada candidato recebe `~<prefixo-da-chave-base64url>`, expandido adaptativamente dos 8 caracteres até a chave completa de 43 caracteres para não colidir; assim chave→alias e alias→chave são bijetivos.
+- Ao enviar, um alias remoto conhecido vence primeiro. A exceção é um endereço Windows de drive absoluto (`C:\...@agent`) exatamente registrado, que permanece local; outros endereços locais exatos são fallback quando não resolvem para alias remoto. O alias remoto resolve para a Pi-key canônica e o `to_pc` canônico é o alvo técnico.
+- Durante a compatibilidade de uma release da Extension `0.6`, o prefixo cross-PC no wire é o nickname assinado bruto selecionado deterministicamente ou, sem nickname, os primeiros 8 caracteres da Pi-key canônica Base64 padrão com padding. Esse label legado nunca vira identidade, autorização ou endereço público.
+- Ao receber pelo relay, o broker renderiza `envelope.from` com seu próprio alias local para `from_pc` e remove apenas o prefixo de apresentação/compatibilidade de destino: o relay já entregou ao PC autenticado selecionado por `to_pc`. ACKs retornam ao `from` wire exato recebido.
+
+UUID v7 garante ordenação temporal sem coordenação para envelopes normais gerados pela Extension.
+
+---
+
+## ACK protocol
+
+Em unicast, cada chamada de `agent_send` aguarda um ACK rápido (default 5s) gerado pelo `Broker` local ou pelo `BrokerRemote` receptor após a entrega — não pelo LLM. Custo: microsegundos local, milissegundos cross-PC. Os resultados públicos atuais de unicast são `received | denied | timeout`; broadcast é enviado como `sent`, sem ACK.
+
+| Status compatível de ACK | Significado |
+|---|---|
+| `received` | Peer online aceitou/recebeu a mensagem, inclusive durante um turn; ela será processada no turno atual ou seguinte. |
+| `busy` | Compatibilidade defensiva com um broker líder antigo: a mensagem foi descartada. Não é comportamento atual; reinicie/substitua o líder antigo antes de reenviar. |
+| `denied` | Peer recusou; abandona. |
+| `timeout` | ACK não chegou em 5s; silêncio genuíno não tem reason. |
+
+Os motivos fechados do relay são `offline`, `not_authorized` e `bad_envelope`: `offline → timeout`; `not_authorized | bad_envelope → denied`. O resultado carrega reason/error explícito (`transport_error: <reason>`) quando o relay confiável o informou.
+
+**Reply de conteúdo** é assíncrona: peer responde com **outro send normal** carregando `re: <send-id-original>`. Sender vê a reply na inbox no próximo turn. `agent_request` continua disponível apenas como comportamento legado/deprecado; o fluxo preferido é `agent_send` + reply assíncrona.
+
+---
+
+## Cross-PC routing
+
+Hoje cross-PC é mediado pelo relay (não P2P direto — fica pra futuro).
+
+A Extension `0.6` inclui por uma release um label wire legado para a janela
+mixed-version. Nova↔antiga funciona quando os dois lados selecionam o mesmo
+nickname assinado, único e sem `:`, ou quando nenhum tem nickname e ambos usam o
+prefixo de 8 caracteres da chave Base64 padrão canônica. Nicknames com delimitador
+ou colisão e visões divergentes de nickname não são cobertos; o receptor antigo
+pode descartá-los silenciosamente. Por isso todos os participantes Extension/MCP
+devem ser atualizados na mesma janela de manutenção, não gradualmente.
+
+### Frame wire WS (Pi-A → Relay)
+
+```jsonc
+{
+  "type": "pi_envelope",
+  "to_pc": "<Pi-B-key Base64 RFC 4648 padrão com padding>",
+  "envelope": {
+    "from": "<label-wire-legado-de-A>:/Users/alice/projeto@frontend",
+    "to": "<label-wire-legado-de-B>:/home/bob/projeto@backend",
+    // demais campos do envelope
+  }
+}
+```
+
+### Frame entregue pelo relay (Relay → Pi-B)
+
+```jsonc
+{
+  "type": "pi_envelope_in",
+  "from_pc": "<Pi-A-key canônica Base64 RFC 4648 padrão com padding, autenticada>",
+  "envelope": { /* envelope encaminhado */ }
+}
+```
+
+### Autorização e anti-spoof
+
+Antes de consultar presença do destino, o Relay permite `A → B` somente se encontrar **um** blob corretamente assinado por um Owner que liste diretamente ambas as Pi-keys. Essa checagem valida assinatura e conteúdo, mas não prova que o Owner pareou ou controla qualquer Pi. Não há fechamento transitivo: `{A,B}` e `{B,C}` não autoriza `A → C`. Um membro malformado invalida toda a contribuição daquele Owner. O cache por remetente é limitado a 1.024 entradas; grants positivos expiram em até 60 segundos e misses negativos em 1 segundo.
+
+No receptor, `from_pc` canônico e autenticado é a única identidade técnica: ele deve pertencer ao snapshot de irmãos diretos, ou o frame é rejeitado. O receptor substitui o prefixo de `envelope.from` pelo seu alias local para essa chave e remove só o prefixo de apresentação/compatibilidade de `envelope.to`, pois `to_pc` já selecionou o destino técnico. Texto de nickname/prefixo enviado pelo remetente nunca é identidade nem regra anti-spoof.
+
+### Erros de transporte com proveniência confiável
+
+O relay envia erros como o seguinte `pi_envelope_in` reservado:
+
+```jsonc
+{
+  "type": "pi_envelope_in",
+  "from_pc": "_relay",
+  "envelope": {
+    "from": "_relay",
+    "to": "<endereço original não vazio ou _unknown>",
+    "id": "<UUID válido para o parser da Extension; atualmente UUIDv4>",
+    "re": "<UUID original válido ou null>",
+    "body": {
+      "type": "transport_error",
+      "reason": "offline | not_authorized | bad_envelope"
+    }
+  }
+}
+```
+
+Somente esse outer autenticado, com essa gramática interna exata, reason fechado e correlação UUID válida, pode virar localmente `from: "broker"` e liquidar uma operação pendente. Um erro confiável é consumido internamente no máximo uma vez. Frames outer privilegiados `_relay` malformados são descartados. Já conteúdo com forma `transport_error` de um peer comum — inclusive texto `_relay` — continua conteúdo comum de inbox/handler, mas nunca liquida pending maps nem ganha proveniência `broker`.
+
+### Compatibilidade e rollout
+
+Implante o Relay `0.3` primeiro: uma Extension antiga pode consumir os erros UUID do Relay novo. Depois coordene a atualização para Extension `0.6` e minimize o período com Extensions antigas e novas, pois a interoperabilidade de wire labels mistos fora dos casos limitados descritos acima permanece adiada. A Extension `0.6` aceita o ID legado lowercase de 32 hex apenas no caminho autenticado e fechado de erro `_relay`, para Relay antigo ou rollback do Relay; esse shim não é o motivo de Relay-first ser seguro. Envelopes comuns continuam exigindo UUID.
+
+---
+
+## Mesh membership
+
+`mesh_versions` é o "cartório" assinado pelo Owner.
+
+### Estrutura
+
+Blob canônico decodificado e assinado pelo Owner:
+
+```json
+{
+  "version": 7,
+  "issued_at": 1780000000000,
+  "owner_pk": "<Owner-key Base64 padrão com padding, 32B>",
+  "members": [
+    { "remote_epk": "<Pi-key Base64 padrão com padding, 32B>", "relay_url": "wss://...", "paired_at": "2026-05-22T...", "nickname": "casa" },
+    { "remote_epk": "<Pi-key Base64 padrão com padding, 32B>", "relay_url": "wss://...", "paired_at": "2026-05-23T...", "nickname": null }
+  ]
+}
+```
+
+O envelope wire/storage carrega esse JSON canônico como `blob` Base64 e sua assinatura Ed25519 como `sig` Base64:
+
+```json
+{
+  "blob": "<Base64 padrão do JSON canônico acima>",
+  "sig": "<Base64 padrão da assinatura Ed25519 do blob por owner_sk>"
+}
+```
+
+`nickname` pode faltar, ser `null` ou string. Apenas contribuições Owner válidas que contêm diretamente a Pi local podem adicionar irmãos; histórico, transitividade e nickname não concedem confiança.
+
+### Storage
+
+Relay armazena o blob inteiro em SQLite, indexado por `owner_pk_hash`: SHA-256 em hexadecimal minúsculo dos 32 bytes brutos decodificados da Owner-key.
+
+- **POST /mesh/<hash>**: cliente publica nova versão (relay verifica assinatura + version monotônica)
+- **GET /mesh/<hash>**: cliente lê última versão; valida assinatura localmente
+
+LWW (last-write-wins) em conflito concorrente. Anti-rollback via version monotônica.
+
+### Self-revoke
+
+Pi-extension faz polling periódico. Se sua Pi-pubkey saiu de `members`, faz self-revoke (sai do mesh) graciosamente.
+
+Detalhes em `plan/24-mesh-membership.md`.
+
+---
+
+## App actions
+
+Vocabulário curado de ações tipadas que o app mobile invoca sobre a sessão do Pi pareado. Cada ação tem payload estruturado e mapeia pra uma API pública do SDK. Pi-extension lida; app não parseia nada.
+
+O **canal de comandos** (`/slash` e `!shell`) é um caminho irmão, não uma exceção a este desenho: o app manda a linha crua e quem classifica é o Pi (que é quem conhece o vocabulário). Os dois convivem — as ações tipadas continuam sendo o que a UI estruturada usa, e `/` existe pro que só tem nome.
+
+| Action | ClientMessage | SDK call no pi-remote |
+|---|---|---|
+| Compact context | `session_compact` | `ctx.compact()` |
+| New session | `session_new` | `ctx.newSession()` |
+| Set model | `model_set {provider, model_id}` | `ModelRegistry.find(...)` + `pi.setModel(model)` |
+| Set thinking | `thinking_set {level}` | `pi.setThinkingLevel(level)` |
+| List models | `list_models` | `ModelRegistry.getAvailable()` |
+
+### Wire — exemplos
+
+```json
+// Request
+{ "type": "session_compact", "id": "<uuid>" }
+
+// Success reply
+{ "type": "action_ok", "in_reply_to": "<uuid>", "action": "session_compact" }
+
+// Failure reply
+{ "type": "action_error", "in_reply_to": "<uuid>", "action": "session_compact",
+  "error": "compact unavailable (no active session ctx)" }
+```
+
+```json
+// Model list request → reply
+{ "type": "list_models", "id": "<uuid>" }
+{
+  "type": "models_list",
+  "in_reply_to": "<uuid>",
+  "models": [
+    { "id": "claude-opus-4-7", "name": "Claude Opus 4.7", "provider": "anthropic",
+      "reasoning": true, "context_window": 200000 }
+  ],
+  "current": { "id": "claude-opus-4-7", "name": "Claude Opus 4.7", "...": "..." }
+}
+```
+
+### Canal de comandos (`/slash` e `!shell`)
+
+O composer aceita comandos direto. `text` viaja **verbatim** (com a barra inicial): o app não mantém lista de nomes, então um Pi que ganha um builtin ou uma extensão nova não precisa de release do app.
+
+```json
+// Palette do `/` — catálogo do que ESTA sala pode rodar
+{ "type": "list_commands", "id": "<uuid>" }
+{
+  "type": "commands_list", "in_reply_to": "<uuid>",
+  "commands": [
+    { "name": "compact", "description": "Compact the session context",
+      "source": "builtin", "scope": "all", "supported": true },
+    { "name": "deploy", "description": "Ship it",
+      "source": "extension", "scope": "daemon", "supported": true },
+    { "name": "login", "description": "Configure provider authentication",
+      "source": "builtin", "scope": "tui", "supported": false }
+  ]
+}
+```
+
+```json
+// Linha `/...` (com a barra) → roteada pelo Pi
+{ "type": "command_invoke", "id": "<uuid>", "text": "/compact manter as notas de migração" }
+{ "type": "action_ok", "in_reply_to": "<uuid>", "action": "command_invoke" }
+{ "type": "action_error", "in_reply_to": "<uuid>", "action": "command_invoke",
+  "error": "/login is only available in the Pi TUI, not from the app" }
+
+// `!cmd` (sem o `!`) → shell no Pi; saída volta como card `bash`
+{ "type": "bash_exec", "id": "<uuid>", "command": "git status -sb",
+  "exclude_from_context": false, "timeout_ms": 120000 }
+```
+
+Três destinos possíveis, decididos no Pi:
+
+| Tipo de nome | Caminho | Onde funciona |
+|---|---|---|
+| `/compact` `/new` `/model` `/thinking` `/name` | Chamadas SDK que a extensão já tem (mesmas das ações tipadas) | Qualquer sala |
+| Comando de extensão (`pi.registerCommand`), `/skill:name`, prompt template | RPC stdin do Pi (`AgentSession.prompt` com expansão ligada) | Só sala **daemon** (supervisor, `pi --mode rpc`) |
+| Resto (`/login`, `/settings`, `/tree`, `/share`, …) | Recusado pelo nome | — |
+
+Por que o split: `user_message` passa por `pi.sendUserMessage`, que o SDK implementa como `AgentSession.prompt(text, {expandPromptTemplates: false})` — esse flag é o que faz texto do app ser texto. Ele também pula comandos de extensão, skills e templates. E builtins não têm API programática: as 22 vivem no loop do TUI. Então o Pi classifica (nunca o app), e o que ele não consegue rodar ele **recusa explicando** em vez de deixar a linha virar mensagem literal pro modelo.
+
+`bash_exec` não usa RPC: a extensão roda no shell e no cwd do próprio Pi e publica o resultado como um card `bash` normal (mais uma mensagem `custom` — `customType: "bash-exec"`, `display: false` — pro modelo ver a saída no próximo turno, igual ao `!` do TUI; `!!`/`exclude_from_context: true` mantém fora do contexto). Assim `!` funciona em TUI-hosted e daemon.
+
+### Thinking levels (enum fixo)
+
+```
+"off" | "minimal" | "low" | "medium" | "high" | "xhigh"
+```
+
+`"xhigh"` só é honrado em famílias de modelo específicas (Anthropic 4.x reasoning, OpenAI o-series). Pi cai pra um nível vizinho quando não suporta — sem erro.
+
+### Raciocínio do modelo (conteúdo do thinking)
+
+O nível acima é a *configuração*; o **conteúdo** do raciocínio é outro canal,
+introduzido depois e aditivo (clientes antigos ignoram o tipo desconhecido).
+
+Streaming, espelhando `agent_chunk` (mesmo `in_reply_to` da turn):
+
+```jsonc
+{ "type": "agent_thinking", "in_reply_to": "msg-1", "delta": "…" }
+```
+
+No histórico (`session_history`) o bloco inteiro viaja como evento próprio, na
+ordem do content array do SDK (thinking antes do texto da mesma mensagem):
+
+```jsonc
+{ "ts": 1730000000000, "type": "agent_thinking", "in_reply_to": "sync_…", "text": "…", "duration_ms": 12400 }
+```
+
+`duration_ms` é o tempo que o bloco levou para streamar (medido no Pi, do
+`thinking_start` ao `thinking_end`) — o app mostra "Thought for 12s". Fica
+**ausente** quando o Pi não pôde medir (histórico re-semeado do arquivo de
+sessão após restart do daemon): aí o app omite o número em vez de inventar um.
+Ao vivo o app também mede o próprio bloco, então um bloco em streaming vai
+contando o tempo no cabeçalho.
+
+Semântica de segmentos: cada bloco de thinking é um fragmento próprio,
+fechado quando chega texto (`agent_chunk`), uma tool (`tool_request`) ou o fim
+da turn (`agent_done`) — então `thinking → texto → tool → thinking → texto`
+renderiza na ordem certa. Blocos `redacted` (ciphertext de safety filter) não
+são enviados. O `text` replayado é truncado por bloco (16 KiB) pra preservar o
+orçamento de bytes do mirror; o streaming ao vivo não tem limite. Modelos sem
+superfície de reasoning não são afetados: nenhum frame novo é emitido.
+
+### Resultado de tool com diff (`edit`)
+
+`tool_result` ganhou um campo opcional `diff` (aditivo; clientes antigos
+ignoram). Ele é o diff que a **própria tool** reporta ter aplicado — hoje só
+`edit` tem um (`details.diff`), e já vem no formato de exibição do Pi
+(`+ 12 texto` / `- 12 texto`), o mesmo que a extensão gera pro preview em
+`args.hunks`:
+
+```jsonc
+{ "type": "tool_result", "tool_call_id": "tc-1", "result": "Successfully replaced 1 block(s)…", "diff": "- 13 const b = 2;\n+ 13 const b = 3;" }
+```
+
+O app renderiza esse diff no cartão da tool (colorido por linha, fonte
+mono) em vez do preview dos args, e **não repete** o texto do resultado quando
+há diff — o `edit` só reafirma o caminho que já está na linha de comando.
+O motivo de existir: o preview é um palpite que o daemon calcula lendo o
+arquivo **antes** da edição e que `session_history` **não** replaya; o diff da
+tool é o que de fato aconteceu e sobrevive a um re-sync. Sem `details.diff`
+(qualquer outra tool) o campo simplesmente não vai — o shape antigo fica
+idêntico.
+
+### Side-effects
+
+Os replies (`action_ok` / `models_list`) só confirmam dispatch. Efeitos visíveis chegam pelos canais normais:
+- Compact concluído → `agent_chunk`/`agent_done` no chat
+- Modelo trocado → evento `model_select` broadcast pra todos os owners conectados
+- Nova sessão → `pair_ok` (ou equivalente) com novo `session_started_at`
+
+### Por que ações tipadas *e* `/` em vez de só um dos dois
+
+O SDK (`@earendil-works/pi-coding-agent`) não expõe API genérica de invocação dos slash commands builtin (`/compact`, `/model`, `/fork`, `/copy`, etc.) — apenas alguns têm equivalente em `ExtensionContextActions`. Um picker que só oferecesse o que tem chamada pronta seria um mirror manual da lista builtin, com matriz de invocabilidade pra manter a cada bump.
+
+As ações tipadas continuam sendo o caminho da UI estruturada (payload com sentido, `action_ok`/`action_error` casados por `in_reply_to`). O canal de comandos cobre o resto sem mirror: a lista vem do `pi.getCommands()` (extensões, templates, skills) mais uma tabela de builtins que só declara **o que a extensão sabe fazer**, e o que ela não sabe recusa por nome em vez de virar mensagem literal. O que viabilizou isso não foi o SDK mudar: foi existir um canal RPC (plan/26) por onde `AgentSession.prompt` é alcançável.
+
+Limite explícito: `/login`, `/settings`, `/tree` e companhia **não** entram — vivem no loop do TUI e aparecem na palette como `scope: "tui"`, desabilitados. O adapter `pi-telegram` segue o padrão de vocabulário curado.
+
+Detalhes em `plan/28-pi-commands.md`.
+
+---
+
+## Imagens (plan/30)
+
+`user_message` aceita um anexo de imagem inline (uma por mensagem hoje),
+opcional e retrocompatível — mensagem só-texto não muda no fio.
+
+### Wire
+ClientMessage `user_message` ganha `images?`:
+
+```jsonc
+{ "type": "user_message", "id": "msg-1", "text": "o que é isto?",
+  "images": [{ "data": "<base64>", "mime": "image/jpeg" }] }
+```
+
+`WireImage = { data: string /* base64 */, mime: string }`. O echo ServerMessage
+`user_message` (broadcast a todos os owners) também carrega `images`, pra cada
+device renderizar o mesmo balão.
+
+### Mapeamento pro modelo
+O Pi monta o content multimodal do SDK na ordem **imagem(ns) → texto**:
+`[{ type:"image", data, mimeType: mime }, { type:"text", text }]` →
+`sendUserMessage(content)`. `mime` (wire) vira `mimeType` (SDK). Sem `images` →
+`sendUserMessage(text)` (string), idêntico ao anterior.
+
+### Capacidade do modelo
+`WireModel` (em `models_list` / `current`) ganha `vision: boolean`, derivado de
+`Model.input.includes("image")`. O app desabilita o anexo quando o modelo ativo
+tem `vision:false`.
+
+### Transporte
+A imagem vai **inline** na `user_message` (base64), dentro do `ct` atual: no caminho App↔Pi ele pode ser encaminhado sem parse, mas é Base64 de JSON em claro, não ciphertext/E2E, e o operador do relay pode lê-lo. Custo: double-base64 (~+77%),
+aceito nesta fatia por usar imagem comprimida (~150–400 KB). Histórico/
+`session_sync` trafega os bytes (decisão #8). Canal binário fica pra Trilha 2.
+
+---
+
+## Arquivos de texto (upload)
+
+`user_message` aceita também um arquivo de texto (um por mensagem hoje),
+opcional e retrocompatível. O que conta como "texto" é decidido **pelo
+conteúdo, nunca pelo nome**: sem byte NUL e decodificável como UTF-8 (BOM
+opcional) ou UTF-16 (BOM obrigatório). `Makefile`, `id_rsa.pub`, `.log`,
+`.gitignore` ou config sem extensão valem; um `.txt` binário não. Teto de
+1 MiB por arquivo (o app corta e marca o conteúdo). O teto vem do envelope
+externo do relay — 4 MiB de payload decodificado, o default com que o nosso
+roda — e não de um limite do Pi: o conteúdo viaja como string JSON, cujo
+escape pode dobrar o tamanho no caso patológico, então 1 MiB é o maior teto
+que ainda não estoura o envelope com nenhum conteúdo.
+
+Ao contrário da imagem, o arquivo **não vira conteúdo do prompt**: o Pi grava
+no disco e passa ao agente o caminho absoluto, para ele ler/editar com as
+ferramentas normais (arquivo grande não custa token até ser aberto).
+
+### Wire
+
+ClientMessage `user_message` ganha `files?`:
+
+```jsonc
+{ "type": "user_message", "id": "msg-1", "text": "resume isto",
+  "files": [{ "name": "notas.md", "text": "# olá" }] }
+```
+
+`WireFile = { name: string, text?: string, path?: string }` — `text` só no
+sentido App→Pi; `path` só no sentido Pi→App (o conteúdo nunca volta). O echo
+ServerMessage `user_message` carrega `files` com o nome + caminho, e o evento
+`user_input` do `session_history` também, pra cada device renderizar o mesmo
+chip.
+
+### Mapeamento pro modelo
+
+O Pi grava cada arquivo em `<home>/.pi/remote/uploads/<room_id>/<nome>` (nome
+sanitizado a um único segmento; reenvio idêntico reusa o arquivo, nome
+diferente ganha sufixo `-1`, `-2`, …) e monta o content do SDK na ordem
+**avisos de upload → imagem(ns) → texto**:
+
+```text
+[Uploaded file: notas.md → /Users/p/.pi/remote/uploads/<room>/notas.md]
+```
+
+O aviso é a única fonte de verdade: o mapper de histórico o extrai de volta
+para `files` e o remove do texto, então um re-sync (ou um restart do daemon
+que semeia o espelho do arquivo de sessão) reconstrói o mesmo chip sem
+estado paralelo.
+
+### Capacidade do modelo
+
+Nenhuma: `vision` gateia só imagem. Arquivo de texto funciona em qualquer
+modelo, então o app mantém o anexo alcançável e desabilita apenas as opções
+Câmera / Galeria quando o modelo ativo não aceita imagem.
+
+---
+
+## Arquivos do Pi para o app (`send_to_phone`)
+
+O espelho do upload: o agente entrega um arquivo que **já está no disco do Pi**
+e ele aparece como card na timeline do chat. O conteúdo vem de volta porque o
+celular não tem como ler o filesystem do Pi.
+
+### Teto: por que ~2 MB
+
+O relay aceita envelope externo de 4 MiB (`RELAY_MAX_CT_MIB`, medido sobre
+`ct`, que é Base64 do JSON interno). Pior caso, com `B` bytes originais:
+
+```text
+B → base64 (JSON interno) ≈ 4/3·B → ct = base64(JSON) ≈ 16/9·B ≈ 1.78·B
+16/9·B ≤ 4 MiB  ⇒  B ≤ ~2.3 MB
+```
+
+Teto adotado: **2 MiB**. Imagem acima disso é **reduzida** no Pi (o
+`resizeImage` do próprio SDK — Photon/WASM, sem dependência nova) até caber;
+texto tem teto próprio de 1 MiB. O que não couber é recusado com mensagem
+acionável, nunca truncado.
+
+### Wire
+
+ServerMessage `file_offer` (Pi → App):
+
+```jsonc
+{ "type": "file_offer", "id": "att_<toolCallId>", "name": "chart.png",
+  "path": "/home/p/chart.png", "mime": "image/png", "size": 184320,
+  "data": "<base64>", "note": "opcional", "resized": true,
+  "original_size": 3145728, "in_reply_to": "get_1" }
+```
+
+ClientMessage `file_get` (App → Pi):
+
+```jsonc
+{ "type": "file_get", "id": "get_1", "path": "/home/p/chart.png",
+  "attachment_id": "att_<toolCallId>" }
+```
+
+O `id` é `att_` + `toolCallId` nos **três** lugares (offer ao vivo, replay de
+histórico, resposta do `file_get`), então o app faz upsert por id: o replay
+nunca duplica o card nem apaga bytes já baixados. `in_reply_to` só aparece na
+resposta a um `file_get`.
+
+Evento de `session_history`:
+
+```jsonc
+{ "ts": 1730, "type": "attachment", "id": "att_tc-1", "name": "chart.png",
+  "path": "/…", "mime": "image/png", "size": 184320, "note": "…" }
+```
+
+**Sem `data`, de propósito**: o `session_history` tem teto de 3 MiB e corta os
+eventos mais antigos quando estoura, então embedder base64 (≈270 KB por
+screenshot) expulsaria meia conversa em ~10 arquivos. O app puxa sob demanda
+com `file_get` — a história fica barata e o byte trafega uma vez, quando alguém
+realmente olha. O pull é **manual** (toque no card): abrir uma sala antiga não
+pode baixar tudo que já foi enviado.
+
+### O gatilho, do lado Pi
+
+Tool `send_to_phone(path, note?)` — um arquivo por chamada. O que conta como
+imagem e o que conta como texto é decidido **pelos bytes, nunca pelo nome**
+(mesma regra do upload): assinatura PNG/JPEG/GIF/WebP/BMP → imagem; senão
+UTF-8/UTF-16 estrito sem NUL → texto; senão recusado. `path` sai pelo
+`realpath`, então symlink e `~` nunca reportam outro lugar que não o nomeado.
+
+O tool **não** publica `tool_request`/`tool_result` para o app: o card de
+anexo É a renderização dessa chamada, e um segundo card seria duplicata. Uma
+**falha** continua aparecendo como tool card — é o único lugar onde o usuário
+vê que não foi.
+
+A metadata do card entra na sessão como custom message `display:false`
+(`remote-pi:attachment`, `details` = metadados): o prefixo a marca como dado
+puro (nenhum custo de token) e o `details` **sobrevive em disco** — ao
+contrário do `details` de um toolResult, que o arquivo de sessão descarta. É
+essa a fonte de verdade do replay, mesma lição da linha de aviso do upload.
+
+### No app
+
+Bytes vão para `<dir do box Hive>/attachments/<id>.bin`; o registro guarda só
+metadados + o nome do blob (um base64 de 2 MB dentro de uma row do Hive
+carregaria a sala inteira na memória a cada leitura). Cache com teto de 64 MB,
+varredura do mais antigo primeiro. Card: imagem vira thumbnail (220 px), texto
+vira nome + preview, sem bytes vira "toque para carregar", erro vira a causa.
+Tocar abre a tela cheia (pinch/double-tap de zoom, texto rolável e selecionável)
+e **salvar** copia o blob para o armazenamento do aparelho via MediaStore —
+imagem em `Pictures/Remote Pi`, o resto em `Download/Remote Pi`, sem pedir
+permissão nenhuma e sem diálogo do sistema por salvamento.
+
+---
+
+## Mensagem enfileirada durante turn ativo
+
+Fila curta **Pi-side, em memória**, de propriedade do Android: enquanto há turn
+ativo, o app pode guardar próximos prompts textuais de follow-up. A
+Pi-extension drena um item quando o turn atual acaba. Não é fila offline do
+relay; restart perde o estado.
+
+### Wire
+
+```jsonc
+// app → Pi-extension
+{ "type": "queued_message_set", "id": "msg-2", "text": "próximo prompt" }
+{ "type": "queued_message_clear", "id": "clear-1", "target_id": "msg-2" }
+{ "type": "queued_message_clear", "id": "clear-all" }
+
+// Pi-extension → app(s)
+{
+  "type": "queued_message_state",
+  "id": "msg-2",
+  "text": "próximo prompt",
+  "items": [
+    { "id": "msg-2", "text": "próximo prompt", "editable": true, "created_at": 1782250000000 }
+  ]
+}
+{ "type": "queued_message_state", "items": [] } // vazio
+```
+
+### Semântica
+
+- `queued_message_set`: cria/substitui uma pendência textual Android-owned. `id`
+  vira o id do `user_message` drenado.
+- `queued_message_clear.target_id`: cancela um item. Sem `target_id`, cancela
+  todos os itens Android-owned (compat com o antigo clear de slot único).
+- Enquanto o Pi está ocupado, cada mudança broadcasta o estado completo para
+  todos os owners conectados.
+- Se `queued_message_set` chega quando o Pi já está idle, a extensão drena
+  imediatamente como `user_message` normal e broadcasta estado vazio, para não
+  deixar item preso esperando um turn futuro.
+- Drain: quando `currentTurnId == null`, `working != true` e não há compaction
+  ativa, remove um item, broadcasta `queued_message_state`, faz handoff para o
+  SDK, e só então ecoa `user_message` normal para todos os owners.
+- `session_sync`: envia o `queued_message_state` atual antes do histórico.
+- Só texto. `images` seguem apenas no `user_message` imediato.
+- Filas internas do Pi/TUI não são expostas/editáveis neste MVP: a extension API
+  não fornece ids estáveis nem mutação segura dessa fila.
+- Relay inalterado; não há E2E e o operador do relay pode ler o conteúdo atual.
+
+---
+
+## Pareamento
+
+QR code mostra Pi-pubkey + room hint + token de uso único.
+
+1. App escaneia QR, conecta no relay como peer efêmero
+2. App envia `pair_request` assinado com **Owner-sk** (prova autoridade)
+3. Pi-extension valida assinatura, adiciona App-key na sua `peers.json` local
+4. App adiciona Pi-pubkey no seu `mesh_versions` local + publica versão nova no relay
+5. Pi-extension passa a aceitar mensagens daquele Owner
+
+Múltiplos Owners podem parear o mesmo PC (concomitância — `peers.json` aceita N entries).
+
+Detalhes em `plan/04-pairing.md`.
+
+---
+
+## Modelo de proteção (Trust Model)
+
+### O que está protegido
+
+- **Pareamento autenticado**: pair_request assinado pela Owner-sk; spoofing requer Owner-sk
+- **WS pro relay sobre TLS**: ninguém na rota (ISP, NAT, MITM clássico) vê o tráfego em claro
+- **Cross-PC checagem assinada**: o Relay só encaminha quando encontra um blob corretamente assinado que liste diretamente ambas as Pi-keys, sem transitividade. Isso não prova pareamento ou controle pelo Owner
+- **Anti-spoof entre Pis**: broker aceita somente `from_pc` canônico autenticado que exista entre irmãos diretos e renderiza seu alias local
+- **Anti-rollback de membership em processo**: versão monotônica + assinatura rejeita regressão durante a vida da instância. O floor da Extension reinicia com o processo; `issued_at` é informativo e memberships não expiram. Persistência anti-rollback entre reinícios não é implementada
+- **Pi-secret protegida**: Keychain do sistema (macOS Keychain / libsecret Linux desktop / Credential Manager Windows). Atacante precisa contexto do user logado E unlock do Keychain
+- **Owner-secret protegida**: iOS Keychain / Android Block Store, sincroniza via iCloud/Google account; recuperável trocando de device
+
+### O que NÃO está protegido (declarado honestamente)
+
+- **Relay vê plaintext do conteúdo atual**. TLS protege o trânsito, mas App↔Pi usa `ct` como Base64 de JSON em claro (pode ser encaminhado sem parse, não é ciphertext), e conteúdo Pi↔Pi, controle/routing/erros e membership assinada são parseados em memória pelo relay conforme necessário. Operador vê quem manda para quem e o conteúdo. Mitigação: **self-hosting** do relay (open source)
+- **Não há E2E** entre app e pi-remote nem entre Pis cross-PC. **Não afirmamos E2E em copy nenhuma do produto**
+- **Headless Linux** (Docker, VPS sem D-Bus session): Pi-key cai pra arquivo `0600` em disco com warning loud. Atacante com acesso ao user pode ler. Recomenda-se GNOME Keyring / KWallet pra hardening real
+- **Backup encriptado completo** (Time Machine, iCloud Drive criptografado etc) pode carregar a Keychain. Atacante precisa do user passphrase do backup
+- **Clone detection ainda não implementado**: 2 PCs com mesma Pi-key (via cópia de arquivo headless ou comprometimento) podem coexistir no relay sem alerta. Em roadmap (plan/27 Wave E3)
+
+### Threat model resumido
+
+| Adversário | Capacidade | Protegido? |
+|---|---|---|
+| Network passive | Sniff TLS | ✅ Sim (cipher TLS) |
+| Network active (MITM) | Sniff + inject | ✅ Sim (TLS + Ed25519 pairing) |
+| Operador do relay público | Lê tudo que passa, persiste | ⚠️ Parcial (mitigação: self-host) |
+| Outro user no PC do alvo | Lê filesystem do alvo | ✅ Sim (Keychain user-bound) |
+| Atacante com root no PC do alvo | Memory dump, processo injection | ❌ Não (modelo de threat aceitável: root = jogo perdido) |
+| Atacante com backup do disco | Restaura disco em outro Mac | ✅ Sim em macOS com FileVault on (recomendado) |
+| Atacante que rouba só `peers.json` | Vê metadata pública (Owner-pubkeys + nicks) | Privacy issue, não impersonation |
+
+---
+
+## Failure modes
+
+| Falha | Comportamento |
+|---|---|
+| Relay desconecta | pi-remote reconnect com backoff; agentes locais continuam falando entre si via UDS broker |
+| Pi-B offline durante envio cross-PC | Sender recebe `timeout` com `transport_error: offline` imediatamente. Sem queue offline no relay |
+| Nenhum blob corretamente assinado lista Pi-A e Pi-B diretamente | Sender recebe `denied` com `transport_error: not_authorized`; a checagem ocorre antes de presença |
+| Owner revoga Pi-A da mesh | Pi-A detecta na próxima poll de mesh_versions, faz self-revoke, sai gracefully |
+| WS Pi reconecta frequente (NAT timeout) | Relay dedupa peer_online emit (transição offline→online apenas); cliente dedupa snapshots idênticos |
+| Relay crash | Tudo cross-PC para; agentes locais continuam funcionando (UDS) |
+
+---
+
+## Roadmap arquitetural (público)
+
+Curto prazo:
+- Wave E2: `chmod 0o600` em `peers.json` + atomic write
+- Wave E3: detecção de clone server-side (alerta quando 2 WS mesma Pi-pubkey de IPs diferentes)
+
+Médio prazo:
+- **Wrappers de harness** (`remote-pi claude`, `remote-pi opencode`): outros agentes coding plugam no broker UDS local via wrapper, ganham mesh sem reimplementar protocolo
+- E2E cifragem do payload (Curve25519 + ChaCha20-Poly1305 entre App ↔ Pi; opcional cross-PC)
+
+Longo prazo:
+- PC-to-PC direto via WebRTC/QUIC (relay vira fallback)
+- HW-bound Pi-key opcional via Secure Enclave (Apple Silicon) / TPM (Linux/Windows)
+
+---
+
+## Implementações de referência
+
+- **Relay** (Rust, axum): [`relay/src/`](relay/src/)
+- **Pi-extension** (Node/TS): [`pi-remote/src/`](pi-remote/src/)
+- **App mobile** (Flutter): [`app/lib/`](app/lib/)
+- **Planos arquiteturais**: [`plan/`](plan/) (especialmente `plan/03-protocol.md`, `plan/23-owner-key-sync.md`, `plan/24-mesh-membership.md`, `plan/25-pc-mesh-bootstrap.md`)
+
+---
+
+## Reportar problemas de segurança
+
+[Definir canal] — por enquanto, abra issue marcando como `security` ou contate maintainers diretamente.
