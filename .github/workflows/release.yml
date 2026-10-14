@@ -1,0 +1,72 @@
+name: release
+
+# Tag `v<semver>` deste repositorio = versao do PLUGIN (linha 0.15.x), independente
+# das tags v1.5.x do app (repo pi-remote-app).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag (ex: v0.15.4)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: tgz + GitHub Release
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Resolve ref
+        id: ref
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "ref=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.ref.outputs.ref }}
+
+      - name: Valida tag <-> package.json
+        working-directory: .
+        run: |
+          TAG="${TAG_RAW#v}"
+          V="$(node -p "require('./package.json').version")"
+          [ "$TAG" = "$V" ] || { echo "::error::tag $TAG != package.json $V"; exit 1; }
+        env:
+          TAG_RAW: ${{ steps.ref.outputs.ref }}
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Build + pack
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+          pnpm pack
+
+      - name: Publica a release
+        run: |
+          TAG="${{ steps.ref.outputs.ref }}"
+          TGZ="$(ls remote-pi-*.tgz)"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$TGZ" --clobber
+          else
+            gh release create "$TAG" --title "$TAG" \
+              --notes "Extensão Pi remote-pi $TAG. Instale com \`pi install git:github.com/fenlyin0420/pi-remote\` (o repo já carrega dist/)." \
+              "$TGZ"
+          fi
+          gh release view "$TAG" --json assets --jq ".assets[].name"

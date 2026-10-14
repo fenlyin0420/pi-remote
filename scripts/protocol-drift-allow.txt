@@ -1,0 +1,9 @@
+# wire 契约镜像的已知例外（一行一个名字；`#` 开头是注释）
+#
+# 只在「确认它不属于 wire 契约、或两边表达方式不同」时加进来；别用它把检查关掉。
+#
+# allow —— 工具权限决策值。TS 侧是字符串联合 "allow" | "deny"
+#          （src/protocol/types.ts 的 approve_tool），Dart 侧是
+#          enum ApproveDecision { allow, deny } 并靠 .name 序列化，
+#          所以文件里没有 'allow' 字面量。wire 值本身一致。
+allow

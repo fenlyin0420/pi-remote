@@ -1,0 +1,53 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: Testes + dist sincronizado + protocolo
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: Test + typecheck
+        run: |
+          pnpm test
+          pnpm typecheck
+
+      # dist/ e o artefato que o Pi carrega (git source nao roda build):
+      # se o build do commit divergir do dist commitado, falha aqui.
+      - name: dist sincronizado com src
+        run: |
+          pnpm build
+          if ! git diff --quiet -- dist; then
+            echo "::error::dist/ desatualizado — rode 'npm run build' (ou pnpm build) e commite dist junto com src"
+            git diff --stat -- dist
+            exit 1
+          fi
+
+      # O app (fenlyin0420/pi-remote-app) espelha src/protocol/types.ts a mao.
+      - name: Protocolo sem drift (vs pi-remote-app)
+        run: |
+          curl -fsSL --retry 3 \
+            https://raw.githubusercontent.com/fenlyin0420/pi-remote-app/main/lib/protocol/protocol.dart \
+            -o /tmp/protocol.dart
+          node scripts/check-protocol-drift.mjs --ts src/protocol/types.ts --dart /tmp/protocol.dart
