@@ -50,4 +50,11 @@ jobs:
           curl -fsSL --retry 3 \
             https://raw.githubusercontent.com/fenlyin0420/pi-remote-app/main/lib/protocol/protocol.dart \
             -o /tmp/protocol.dart
-          node scripts/check-protocol-drift.mjs --ts src/protocol/types.ts --dart /tmp/protocol.dart
+          curl -fsSL --retry 3 \
+            https://raw.githubusercontent.com/fenlyin0420/pi-remote-app/main/scripts/protocol-fixtures.sha256 \
+            -o /tmp/peer-fixtures.sha256
+          node scripts/check-protocol-drift.mjs \
+            --ts src/protocol/types.ts \
+            --dart /tmp/protocol.dart \
+            --fixtures .orchestration/contracts/fixtures \
+            --peer-manifest /tmp/peer-fixtures.sha256

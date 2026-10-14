@@ -727,7 +727,7 @@ describe("state machine + pair_request flow", () => {
 
 describe("contract fixtures: pair_*", () => {
   const fixtureDir = fileURLToPath(
-    new URL("../../.orchestration/contracts/fixtures", import.meta.url),
+    new URL("../.orchestration/contracts/fixtures", import.meta.url),
   );
 
   test("pair_request.jsonl parses into ClientMessage shape", () => {

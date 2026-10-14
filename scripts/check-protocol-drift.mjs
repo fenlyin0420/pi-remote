@@ -21,7 +21,9 @@
 // 载荷里的字段（如 input_tokens/output_tokens），那些本来就不在插件协议里。
 // 大小写混排字段名（camelCase）也在 A 的范围内；纯排版差异不会命中。
 
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { join, relative } from "node:path";
 
 const args = process.argv.slice(2);
 const opt = (name, fallback = undefined) => {
@@ -82,6 +84,68 @@ const missingDiscriminants = [...tsDiscriminants]
 // 提示用（不算失败）：Dart 里读到、TS 没声明的字段
 const dartOnlyFields = [...dartFields].filter((f) => !tsFields.has(f)).sort();
 
+// C/D. fixtures 清单（第三个共享产物：两边各存一份 wire 金样本）
+const fixturesDir = opt("fixtures");
+const manifestPath = opt("manifest", "scripts/protocol-fixtures.sha256");
+const peerManifestPath = opt("peer-manifest");
+const writeManifest = flag("write-manifest");
+
+function walk(dir, base = dir, acc = []) {
+	for (const entry of readdirSync(dir).sort()) {
+		const full = join(dir, entry);
+		if (statSync(full).isDirectory()) walk(full, base, acc);
+		else acc.push(relative(base, full).split("\\").join("/"));
+	}
+	return acc;
+}
+function manifestOf(dir) {
+	const lines = [];
+	for (const rel of walk(dir).sort()) {
+		const sha = createHash("sha256").update(readFileSync(join(dir, rel))).digest("hex");
+		lines.push(`${sha}  ${rel}`);
+	}
+	return lines.join("\n") + "\n";
+}
+function parseManifest(text) {
+	const map = new Map();
+	for (const line of text.split("\n")) {
+		const m = line.match(/^([0-9a-f]{64})\s+(.+)$/);
+		if (m) map.set(m[2].trim(), m[1]);
+	}
+	return map;
+}
+function diffManifests(local, peer) {
+	const out = [];
+	for (const [name, sha] of local) {
+		if (!peer.has(name)) out.push(`+ 仅本仓有: ${name}`);
+		else if (peer.get(name) !== sha) out.push(`≠ 内容不同: ${name}`);
+	}
+	for (const name of peer.keys()) if (!local.has(name)) out.push(`- 仅对端有: ${name}`);
+	return out;
+}
+
+let fixtures = null;
+if (fixturesDir) {
+	if (!existsSync(fixturesDir)) {
+		console.error(`找不到 fixtures 目录: ${fixturesDir}`);
+		process.exit(2);
+	}
+	const local = manifestOf(fixturesDir);
+	if (writeManifest) {
+		writeFileSync(manifestPath, local);
+		console.log(`已写 ${manifestPath}（${local.trim().split("\n").length} 个文件）`);
+	}
+	fixtures = { count: local.trim().split("\n").length, vsManifest: [], vsPeer: [] };
+	if (existsSync(manifestPath)) {
+		fixtures.vsManifest = diffManifests(parseManifest(local), parseManifest(readFileSync(manifestPath, "utf8")));
+	} else {
+		fixtures.vsManifest = [`(未找到 ${manifestPath}，跳过本仓清单比对)`];
+	}
+	if (peerManifestPath && existsSync(peerManifestPath)) {
+		fixtures.vsPeer = diffManifests(parseManifest(local), parseManifest(readFileSync(peerManifestPath, "utf8")));
+	}
+}
+
 const report = {
 	ts: tsPath,
 	dart: dartPath,
@@ -94,11 +158,14 @@ const report = {
 	missingFields,
 	missingDiscriminants,
 	info_dartOnlyFields: dartOnlyFields,
+	fixtures,
 };
 
 if (asJson) console.log(JSON.stringify(report, null, 1));
 
-const failed = missingFields.length + missingDiscriminants.length > 0;
+const failed =
+	missingFields.length + missingDiscriminants.length > 0 ||
+	Boolean(fixtures && (fixtures.vsManifest.some((l) => !l.startsWith("(")) || fixtures.vsPeer.length));
 if (!asJson) {
 	if (allow.size > 0) console.log(`allowlist: ${[...allow].sort().join(", ")}`);
 	console.log(`TS 字段 ${tsFields.size} / Dart 字段 ${dartFields.size} · TS 判别值 ${tsDiscriminants.size}`);
@@ -113,6 +180,20 @@ if (!asJson) {
 	if (dartOnlyFields.length) {
 		console.log(`\nℹ️  Dart 侧多出 ${dartOnlyFields.length} 个字段（多为 Pi 核心载荷，非失败项）：`);
 		console.log(`   ${dartOnlyFields.join(", ")}`);
+	}
+	if (fixtures) {
+		console.log(`\nfixtures: ${fixtures.count} 个文件`);
+		const show = (title, lines) => {
+			if (!lines.length) return;
+			console.error(`${title} (${lines.length}):`);
+			for (const l of lines) console.error(`   ${l}`);
+		};
+		show("❌ 本仓 fixtures 与已提交清单不一致（改了 fixtures 就重跑 --write-manifest）", fixtures.vsManifest.filter((l) => !l.startsWith("(")));
+		show("❌ 与对端仓 fixtures 不一致（两个仓的 wire 金样本必须同源）", fixtures.vsPeer);		if (!fixtures.vsManifest.filter((l) => !l.startsWith("(")).length) console.log("✅ fixtures 与已提交清单一致");
+		if (peerManifestPath) {
+			if (fixtures.vsPeer.length) console.error("❌ 与对端仓 fixtures 不一致（两个仓的 wire 金样本必须同源）");
+			else console.log("✅ fixtures 与对端仓一致");
+		}
 	}
 	if (failed) {
 		console.error(`\n修 wire 要两个仓一起改；确实不属于契约的写进 ${allowPath}`);
