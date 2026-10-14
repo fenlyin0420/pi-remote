@@ -10,12 +10,7 @@
 
 **Homepage:** <https://remote-pi.jacobmoura.work>
 
-> **This repository** is the standalone Pi plugin (repo root **is** the Pi package;
-> the built `dist/` is committed because Pi's git source only clones, it never builds).
-> The Flutter client lives in [`fenlyin0420/pi-remote-app`](https://github.com/fenlyin0420/pi-remote-app);
-> `PROTOCOL.md` here is the canonical wire contract and the app mirrors it.
-> The old monorepo (app + plugin + cockpit/relay/site) is archived at
-> [`fenlyin0420/remote_pi`](https://github.com/fenlyin0420/remote_pi).
+The phone app lives in [`fenlyin0420/pi-remote-app`](https://github.com/fenlyin0420/pi-remote-app).
 
 `/remote-pi` is a single slash command that wires both at once. Run it; the
 first time it asks a couple of questions and you are done.
