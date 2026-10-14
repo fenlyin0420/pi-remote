@@ -10,6 +10,13 @@
 
 **Homepage:** <https://remote-pi.jacobmoura.work>
 
+> **This repository** is the standalone Pi plugin (repo root **is** the Pi package;
+> the built `dist/` is committed because Pi's git source only clones, it never builds).
+> The Flutter client lives in [`fenlyin0420/pi-remote-app`](https://github.com/fenlyin0420/pi-remote-app);
+> `PROTOCOL.md` here is the canonical wire contract and the app mirrors it.
+> The old monorepo (app + plugin + cockpit/relay/site) is archived at
+> [`fenlyin0420/remote_pi`](https://github.com/fenlyin0420/remote_pi).
+
 `/remote-pi` is a single slash command that wires both at once. Run it; the
 first time it asks a couple of questions and you are done.
 
@@ -17,7 +24,7 @@ first time it asks a couple of questions and you are done.
 
 For wire format, identity model, ACK protocol, cross-PC routing, mesh
 membership, and the trust model (what the relay sees and doesn't see),
-read [`PROTOCOL.md`](../PROTOCOL.md) at the repo root. It is the canonical
+read [`PROTOCOL.md`](./PROTOCOL.md) at the repo root. It is the canonical
 document — this README only covers user-facing setup.
 
 ---
@@ -27,7 +34,7 @@ document — this README only covers user-facing setup.
 Install the extension (one-time):
 
 ```bash
-pi install npm:remote-pi
+pi install git:github.com/fenlyin0420/pi-remote
 ```
 
 Then in any Pi terminal:
@@ -133,7 +140,7 @@ Communication uses WebSocket over TLS to the relay. Fields such as `ct` are
 wire containers, not a systemwide end-to-end confidentiality guarantee: current
 Pi-forward, cross-PC, app, and control envelopes visible to the relay are not
 fully opaque or E2E encrypted. A relay operator can see routed plaintext
-protocol content and metadata; see [`PROTOCOL.md`](../PROTOCOL.md) for the exact
+protocol content and metadata; see [`PROTOCOL.md`](./PROTOCOL.md) for the exact
 trust boundaries.
 
 **Get the app** — all current download options (Google Play, App Store, and
@@ -159,7 +166,7 @@ when the input is empty) to open the Quick Actions sheet:
 Each action gets a structured `action_ok` / `action_error` reply so the app
 can show a SnackBar on failure. Visible side-effects (chat output, model
 change broadcasts, compaction notice) still flow through the normal chat
-channels. The wire schema is documented in [`PROTOCOL.md`](../PROTOCOL.md)
+channels. The wire schema is documented in [`PROTOCOL.md`](./PROTOCOL.md)
 under "App actions".
 
 It is **not** a generic slash-command picker. The Pi SDK does not expose
@@ -216,7 +223,7 @@ messages are unaffected.
 Requirements: Node 20+, Pi (the host coding agent).
 
 ```bash
-pi install npm:remote-pi
+pi install git:github.com/fenlyin0420/pi-remote
 ```
 
 The extension self-registers the `/remote-pi` slash command and deploys an
@@ -544,10 +551,10 @@ See [`docs/daemon.md`](./docs/daemon.md) for troubleshooting.
 
 ```bash
 # Install the package globally so `remote-pi` and `pi-supervisord`
-# are on your PATH (`pi install npm:remote-pi` alone makes the Pi
+# are on your PATH (`pi install git:github.com/fenlyin0420/pi-remote` alone
 # extension available but does NOT expose the CLI binaries — see
 # https://docs.npmjs.com/cli/v10/configuring-npm/package-json#bin).
-npm install -g remote-pi
+npm install -g github:fenlyin0420/pi-remote
 
 # Install the supervisor as a user-level system service. Linux uses
 # systemd --user; macOS uses launchd LaunchAgent. Both auto-start at
@@ -704,11 +711,12 @@ for palette and export sizes.
 
 ## Links
 
-- Homepage: <https://remote-pi.jacobmoura.work>
-- Source: <https://github.com/jacobaraujo7/remote_pi>
+- Homepage (upstream project): <https://remote-pi.jacobmoura.work>
+- Source: <https://github.com/fenlyin0420/pi-remote>
+- Flutter client (phone app): <https://github.com/fenlyin0420/pi-remote-app>
 - Pi coding agent: <https://github.com/earendil-works/pi>
-- Relay (self-hosting guide): <https://github.com/jacobaraujo7/remote_pi/blob/main/relay/README.md>
-- Issues / bugs: <https://github.com/jacobaraujo7/remote_pi/issues>
+- Relay (self-hosting guide, upstream): <https://github.com/jacobaraujo7/remote_pi/blob/main/relay/README.md>
+- Issues / bugs: <https://github.com/fenlyin0420/pi-remote/issues>
 
 ---
 

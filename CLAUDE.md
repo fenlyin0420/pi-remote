@@ -11,7 +11,7 @@ mesmo Owner, broker UDS local + relay forward Pi-to-Pi via WS roteiam
 envelopes com prefixo `<pc>:<peer>`.
 
 Protocolo, identidades, ACK, roteamento cross-PC e trust model: ver
-[`../PROTOCOL.md`](../PROTOCOL.md) (doc canônica do repo).
+[`./PROTOCOL.md`](./PROTOCOL.md) (doc canônica do repo).
 
 ## Stack
 

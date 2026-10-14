@@ -33,7 +33,7 @@ export function findSupervisorScript() {
  * Absolute path to the extension's CLI entry (`dist/index.js`). This is
  * the file we symlink to `~/.local/bin/remote-pi` so the user can run
  * `remote-pi <subcommand>` from any shell after installing the extension
- * through Pi (`pi install npm:remote-pi`).
+ * through Pi (`pi install git:github.com/fenlyin0420/pi-remote`).
  *
  * Same resolution strategy as `findSupervisorScript`: from
  * `dist/daemon/install.js` → `dist/index.js`.
@@ -377,7 +377,7 @@ export function isOnPath(dir, envPath = process.env["PATH"] ?? "") {
 export function linkCliBinaries(home = homedir(), paths = {}, opts = {}) {
     const binDir = userLocalBinDir(home);
     // Windows (plan/40): no POSIX symlinks. Installing via Pi (`pi install
-    // npm:remote-pi`) never reaches PATH, so write real `.cmd` shims into
+    // git source) never reaches PATH, so write real `.cmd` shims into
     // `~/.local/bin` and add that dir to the user's PATH (HKCU — no admin).
     if (platform() === "win32") {
         return _linkCliBinariesWindows(home, binDir, paths, opts);

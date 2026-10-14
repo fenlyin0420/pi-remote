@@ -36,7 +36,7 @@ export declare function findSupervisorScript(): string;
  * Absolute path to the extension's CLI entry (`dist/index.js`). This is
  * the file we symlink to `~/.local/bin/remote-pi` so the user can run
  * `remote-pi <subcommand>` from any shell after installing the extension
- * through Pi (`pi install npm:remote-pi`).
+ * through Pi (`pi install git:github.com/fenlyin0420/pi-remote`).
  *
  * Same resolution strategy as `findSupervisorScript`: from
  * `dist/daemon/install.js` → `dist/index.js`.

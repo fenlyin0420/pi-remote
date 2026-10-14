@@ -63,7 +63,7 @@ export function findSupervisorScript(): string {
  * Absolute path to the extension's CLI entry (`dist/index.js`). This is
  * the file we symlink to `~/.local/bin/remote-pi` so the user can run
  * `remote-pi <subcommand>` from any shell after installing the extension
- * through Pi (`pi install npm:remote-pi`).
+ * through Pi (`pi install git:github.com/fenlyin0420/pi-remote`).
  *
  * Same resolution strategy as `findSupervisorScript`: from
  * `dist/daemon/install.js` → `dist/index.js`.
@@ -426,7 +426,7 @@ function _execElevatedWindows(lines: string[], log: string[]): void {
 
 // ── CLI bin linking (plan/27) ─────────────────────────────────────────────────
 //
-// When the user installs Remote Pi through Pi (`pi install npm:remote-pi`),
+// When the user installs Remote Pi through Pi (`pi install git:github.com/fenlyin0420/pi-remote`),
 // the extension's `bin` entries in package.json never reach `$PATH` — Pi's
 // installer ignores them. Without `npm install -g remote-pi` a second time,
 // the user can't run `remote-pi daemon …` from a shell.
@@ -490,7 +490,7 @@ export function linkCliBinaries(
   const binDir = userLocalBinDir(home);
 
   // Windows (plan/40): no POSIX symlinks. Installing via Pi (`pi install
-  // npm:remote-pi`) never reaches PATH, so write real `.cmd` shims into
+  // git source) never reaches PATH, so write real `.cmd` shims into
   // `~/.local/bin` and add that dir to the user's PATH (HKCU — no admin).
   if (platform() === "win32") {
     return _linkCliBinariesWindows(home, binDir, paths, opts);

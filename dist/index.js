@@ -4597,7 +4597,7 @@ async function _cronLog(rest, ctx) {
 /**
  * `linkCli` controls whether we symlink `remote-pi` + `pi-supervisord`
  * into `~/.local/bin/`. The slash-command path passes `true` (user is
- * inside Pi's TUI — they installed via `pi install npm:remote-pi` and
+ * inside Pi's TUI — they installed via `pi install git:github.com/fenlyin0420/pi-remote` and
  * need us to expose the CLI for them). The standalone-CLI path passes
  * `false` because the user is already running our binary from PATH (they
  * did `npm install -g remote-pi`), so re-linking would point their
