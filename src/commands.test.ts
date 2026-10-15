@@ -877,6 +877,74 @@ describe("session_switch", () => {
   });
 });
 
+// ── room_delete: the ack must survive a self-kill ────────────────────────────────
+
+describe("room_delete — self-kill ack", () => {
+  // The reported bug: the app rides the delete frame on the room being
+  // deleted. That room's own process then asks the supervisor to kill it
+  // and dies before it can send `action_ok` — the app's promise rides out
+  // its full 15 s timeout (a "timeout" banner after a successful delete).
+  // The handler must send the ack BEFORE the supervisor call in that case.
+  const path = process.cwd();
+
+  test("self-delete: the ack goes out before the kill, so it survives", async () => {
+    process.env["REMOTE_PI_EPHEMERAL"] = "1";
+    _setRoomMetaForTest({ name: "proj#2", cwd: path });
+    const sender = makeSender();
+    h.callSupervisor.mockImplementation(async () => {
+      // At the moment the kill is issued, the ack must already be sent —
+      // the process dies right after this call resolves.
+      const acked = sender.sent.some((m) => m.type === "action_ok");
+      expect(acked, "ack must precede the supervisor kill").toBe(true);
+      return { killed: true } as never;
+    });
+    route({ type: "room_delete", id: "rd1", path, name: "proj#2" }, sender);
+    await vi.waitFor(() => expect(h.callSupervisor).toHaveBeenCalledTimes(1));
+    expect(h.callSupervisor).toHaveBeenCalledWith({
+      op: "kill",
+      room_id: roomIdFor(path, "proj#2"),
+      cwd: path,
+      name: "proj#2",
+    });
+    expect(sender.sent).toHaveLength(1);
+    expect(sender.last()).toMatchObject({
+      type: "action_ok",
+      in_reply_to: "rd1",
+      action: "room_delete",
+    });
+  });
+
+  test("delete of another room: the ack follows the kill as before", async () => {
+    process.env["REMOTE_PI_EPHEMERAL"] = "1";
+    _setRoomMetaForTest({ name: "other", cwd: path });
+    h.callSupervisor.mockResolvedValue({ killed: true });
+    const sender = makeSender();
+    route({ type: "room_delete", id: "rd2", path, name: "proj#2" }, sender);
+    await vi.waitFor(() => expect(sender.sent).toHaveLength(1));
+    expect(sender.last()).toMatchObject({
+      type: "action_ok",
+      in_reply_to: "rd2",
+      action: "room_delete",
+    });
+    expect(h.callSupervisor).toHaveBeenCalledWith({
+      op: "kill",
+      room_id: roomIdFor(path, "proj#2"),
+      cwd: path,
+      name: "proj#2",
+    });
+  });
+
+  test("same name in a different cwd is not a self-delete", async () => {
+    process.env["REMOTE_PI_EPHEMERAL"] = "1";
+    _setRoomMetaForTest({ name: "proj#2", cwd: "/other/cwd" });
+    h.callSupervisor.mockResolvedValue({ killed: true });
+    const sender = makeSender();
+    route({ type: "room_delete", id: "rd3", path, name: "proj#2" }, sender);
+    await vi.waitFor(() => expect(sender.sent).toHaveLength(1));
+    expect(sender.last()).toMatchObject({ type: "action_ok", in_reply_to: "rd3" });
+  });
+});
+
 // ── feedback: a command that can't do anything must say so ────────────────────
 
 describe("command_invoke — feedback", () => {

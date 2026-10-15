@@ -5761,6 +5761,14 @@ function _normalizeRoomPath(input: string): string {
   return p;
 }
 
+/** Path equality through symlinks (missing paths compare raw). */
+function _sameRealPath(a: string, b: string): boolean {
+  const real = (p: string): string => {
+    try { return realpathSync(p); } catch { return p; }
+  };
+  return real(a) === real(b);
+}
+
 /**
  * room_create: normalize the path, verify it exists (or create it when
  * `create_if_missing`), then spawn an EPHEMERAL supervisor session for that
@@ -5840,6 +5848,20 @@ async function _handleRoomDelete(
   try {
     const normalized = _normalizeRoomPath(msg.path);
     const name = msg.name?.trim() || undefined;
+    // SELF-DELETE: the frame rides on the room being deleted (no sibling
+    // room carried it). This process IS that room — the supervisor will
+    // stop/kill it the moment we ask, so the ack can only be sent BEFORE
+    // the call, or it is lost and the app's promise rides out its full
+    // 15 s timeout (a "timeout" banner after a successful delete).
+    const self =
+      name !== undefined &&
+      _myRoomMeta !== null &&
+      _myRoomMeta.name === name &&
+      _sameRealPath(normalized, _myRoomMeta.cwd);
+    const ack = () => {
+      if (!self) sender.send({ type: "action_ok", in_reply_to: msg.id, action: "room_delete" });
+    };
+    if (self) sender.send({ type: "action_ok", in_reply_to: msg.id, action: "room_delete" });
     if (name) {
       const roomId = roomIdFor(normalized, name);
       const kill = await callSupervisor({
@@ -5849,7 +5871,7 @@ async function _handleRoomDelete(
         name,
       });
       if (kill.killed) {
-        sender.send({ type: "action_ok", in_reply_to: msg.id, action: "room_delete" });
+        ack();
         return;
       }
       // Not an ephemeral room — does it match a registered daemon in this
@@ -5861,11 +5883,11 @@ async function _handleRoomDelete(
         try {
           await callSupervisor({ op: "restart", id: daemonIdForCwd(normalized) });
         } catch { /* no supervisor / nothing running — still ok */ }
-        sender.send({ type: "action_ok", in_reply_to: msg.id, action: "room_delete" });
+        ack();
         return;
       }
       // TUI or otherwise unmanaged — nothing to stop.
-      sender.send({ type: "action_ok", in_reply_to: msg.id, action: "room_delete" });
+      ack();
       return;
     }
     // Legacy frame without a name: cycle the daemon for this cwd if one is
