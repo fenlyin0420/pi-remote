@@ -22,6 +22,7 @@ describe("control_protocol — request/reply framing", () => {
       { op: "stop_all" },
       { op: "restart_all" },
       { op: "send", id: "abc12345", text: "Refactor X" },
+      { op: "rpc", id: "abc12345", command: { type: "get_state" }, timeout_ms: 5000, pid: 4242 },
       { op: "register", cwd: "/Users/x/Movies" },
       { op: "unregister", id: "abc12345" },
     ];

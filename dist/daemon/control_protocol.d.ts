@@ -53,6 +53,7 @@ export type ControlRequest = {
     id: string;
     command: RpcCommandWire;
     timeout_ms?: number;
+    pid?: number;
 } | {
     op: "register";
     cwd: string;

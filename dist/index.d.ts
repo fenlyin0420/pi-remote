@@ -30,7 +30,7 @@
  *   for integration tests.
  */
 import type { ExtensionContext, ExtensionFactory } from "@earendil-works/pi-coding-agent";
-import type { ClientMessage, SessionHistoryEvent, WireCommand } from "./protocol/types.js";
+import type { ClientMessage, SessionHistoryEvent, ThinkingLevel, WireCommand } from "./protocol/types.js";
 import { PlainPeerChannel } from "./transport/peer_channel.js";
 export type RemoteState = "idle" | "started";
 /** Relay connectivity as seen by an RPC client (Cockpit). Derived from
@@ -44,6 +44,18 @@ export type RelayConnectivity = "connected" | "reconnecting" | "disconnected";
  *  transcript entry. Starts with NUL so it can't collide with real user input
  *  and doesn't begin with "/" (which would route to the command parser). */
 export declare const CTRL_PREFIX = "\0remote-pi-ctrl:";
+declare let _myRoomMeta: {
+    name: string;
+    cwd: string;
+    model?: string;
+    thinking?: ThinkingLevel;
+    working?: boolean;
+    context?: {
+        used: number;
+        limit: number;
+    };
+    first_message?: string;
+} | null;
 /** Test seam: forget queued images between cases. */
 export declare function _resetPendingToolImagesForTest(): void;
 /** Test seam: land uploads in a temp dir instead of `~/.pi/remote/uploads`. */
@@ -161,6 +173,8 @@ export declare function _setLastCtxForTest(ctx: unknown): void;
 /** Test-only: anchor the `is_current` flag on `session_list` + the
  *  session-replacement detection to a known file. */
 export declare function _setLastKnownSessionFileForTest(file: string | null): void;
+/** Test-only: set (or clear) the room meta the extension announces. */
+export declare function _setRoomMetaForTest(meta: Pick<NonNullable<typeof _myRoomMeta>, "name" | "cwd"> | null): void;
 /** Test-only: exposes pending lock-wait timer state. */
 export declare function _hasPendingLockWaitForTest(): boolean;
 export declare const THINKING_EVENT_MAX_CHARS = 16384;

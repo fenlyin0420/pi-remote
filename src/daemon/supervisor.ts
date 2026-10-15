@@ -288,7 +288,7 @@ export class Supervisor {
       case "restart_all":  return this._opRestartAll();
       case "restart":      return this._opRestart(req.id);
       case "send":         return this._opSend(req.id, req.text);
-      case "rpc":          return this._opRpc(req.id, req.command, req.timeout_ms);
+      case "rpc":          return this._opRpc(req.id, req.command, req.timeout_ms, req.pid);
       case "register":     return this._opRegister(req.cwd);
       case "unregister":   return this._opUnregister(req.id);
       case "spawn":        return this._opSpawn(req);
@@ -442,10 +442,13 @@ export class Supervisor {
   }
 
   /**
-   * Forwards one Pi RPC command to a daemon's stdin and (by default) waits for
-   * the child's matching `response` line, so a rejection (unknown RPC type,
-   * preflight failure such as "no model selected") travels back to the caller
-   * as real text instead of a silent no-op.
+   * Forwards one Pi RPC command to a child's stdin (registry daemon or
+   * ephemeral phone-forked room) and (by default) waits for the child's
+   * matching `response` line, so a rejection (unknown RPC type, preflight
+   * failure such as "no model selected") travels back to the caller as real
+   * text instead of a silent no-op. The reply echoes the RESOLVED child's
+   * id (`slot.id`), not the requested one — for an ephemeral room the pid
+   * path may resolve a different slot than the (predicted) id asked for.
    *
    * `RPC_PASSTHROUGH` is the whole authority model here: the supervisor only
    * forwards commands on that list, so a bug in one caller cannot reach
@@ -457,12 +460,25 @@ export class Supervisor {
     id: string,
     command: RpcCommandWire,
     timeoutMs?: number,
+    callerPid?: number,
   ): Promise<ControlReply<unknown>> {
     const type = typeof command?.type === "string" ? command.type : "";
     if (!RPC_PASSTHROUGH.has(type)) {
       return { ok: false, error: `rpc command not allowed: ${type || "(missing type)"}` };
     }
-    const slot = this.children.get(id);
+    // Slot resolution: the caller's OWN pid first — it is the only key that
+    // is unambiguous for ephemeral (phone-forked) rooms, whose `id` is
+    // either a cwd-only daemon id (a DIFFERENT room's child) or a predicted
+    // room_id the cwd lock may not have landed on (neighbouring `#N`).
+    // Fall back to the id maps for callers that don't send a pid: registry
+    // daemons by daemon id, ephemeral rooms by relay room_id.
+    let slot: ChildSlot | undefined;
+    if (typeof callerPid === "number" && Number.isInteger(callerPid) && callerPid > 0) {
+      slot =
+        [...this.children.values()].find((s) => s.child.pid === callerPid) ??
+        [...this.ephemeral.values()].find((s) => s.child.pid === callerPid);
+    }
+    if (!slot) slot = this.children.get(id) ?? this.ephemeral.get(id);
     if (!slot) return { ok: false, error: `daemon ${id} not running` };
     if (slot.child.state !== "running") {
       return { ok: false, error: `daemon ${id} state is ${slot.child.state}` };
@@ -470,12 +486,14 @@ export class Supervisor {
     const wait = Math.min(Math.max(timeoutMs ?? RPC_DEFAULT_TIMEOUT_MS, 100), RPC_MAX_TIMEOUT_MS);
     if (command.await === false) {
       const delivered = slot.child.sendCommand(command);
-      return { ok: true, data: { id, delivered } };
+      return { ok: true, data: { id: slot.id, delivered } };
     }
     const response = await slot.child.awaitCommand(command, wait);
     return {
       ok: true,
-      data: response === null ? { id, delivered: true } : { id, delivered: true, response },
+      data: response === null
+        ? { id: slot.id, delivered: true }
+        : { id: slot.id, delivered: true, response },
     };
   }
 

@@ -43,7 +43,16 @@ export type ControlRequest =
   // this for `prompt`; `rpc` carries any other Pi RPC command (see
   // `dist/modes/rpc/rpc-types.d.ts`) and, when the caller cares, waits for the
   // matching `response` line so the child's own error text can travel back.
-  | { op: "rpc"; id: string; command: RpcCommandWire; timeout_ms?: number }
+  //
+  // `pid` is the CALLING child's own process id — the authoritative routing
+  // key. An ephemeral (phone-forked) room is NOT a registry daemon: its
+  // cwd-only daemon id would address the cwd's registry daemon (a DIFFERENT
+  // room — a fork's `switch_session` would replace the source room's live
+  // conversation), and its relay room_id can differ from the one the
+  // supervisor predicted when the child's cwd lock lands on a neighbouring
+  // `#N`. When present, the supervisor resolves the slot by pid first and
+  // falls back to `id` (registry map, then ephemeral map) for older callers.
+  | { op: "rpc"; id: string; command: RpcCommandWire; timeout_ms?: number; pid?: number }
   | { op: "register"; cwd: string }
   | { op: "unregister"; id: string }
   // ── ephemeral (phone-created) rooms — NEVER written to the daemon registry ──

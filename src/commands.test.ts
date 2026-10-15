@@ -13,6 +13,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ServerMessage } from "./protocol/types.js";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { roomIdFor } from "./rooms.js";
+import { daemonIdForCwd } from "./daemon/id.js";
 
 const h = vi.hoisted(() => ({
   callSupervisor: vi.fn(),
@@ -39,6 +41,7 @@ const {
   _getMessageBufferForTest,
   _setLastCtxForTest,
   _setLastKnownSessionFileForTest,
+  _setRoomMetaForTest,
 } = indexModule;
 
 // ── Harness ───────────────────────────────────────────────────────────────────
@@ -93,10 +96,14 @@ beforeEach(() => {
   h.callSupervisor.mockResolvedValue({ id: "daemon-1", delivered: true });
   _setMessageBufferForTest([]);
   delete process.env["REMOTE_PI_DAEMON"];
+  delete process.env["REMOTE_PI_EPHEMERAL"];
+  _setRoomMetaForTest(null);
 });
 
 afterEach(() => {
   delete process.env["REMOTE_PI_DAEMON"];
+  delete process.env["REMOTE_PI_EPHEMERAL"];
+  _setRoomMetaForTest(null);
 });
 
 describe("notify capture — other extensions' notifications", () => {
@@ -489,6 +496,7 @@ describe("command_invoke — classification", () => {
     expect(h.callSupervisor).toHaveBeenCalledWith({
       op: "rpc",
       id: expect.any(String),
+      pid: process.pid,
       command: { type: "prompt", message: "/deploy prod", streamingBehavior: "steer" },
     });
   });
@@ -813,8 +821,40 @@ describe("session_switch", () => {
     expect(h.callSupervisor).toHaveBeenCalledWith({
       op: "rpc",
       id: expect.any(String),
+      pid: process.pid,
       command: { type: "switch_session", sessionPath: path },
     });
+  });
+
+  test("a fork (ephemeral) room addresses the switch at its OWN room, not the cwd's daemon", async () => {
+    // The reported bug: the old code sent `daemonIdForCwd(cwd)` from a fork
+    // room, so the supervisor delivered the switch_session to the SOURCE
+    // room's process and replaced its live conversation. An ephemeral room
+    // must target its relay room_id (plus its own pid) instead.
+    process.env["REMOTE_PI_DAEMON"] = "1";
+    process.env["REMOTE_PI_EPHEMERAL"] = "1";
+    _setPiForTest(makePi());
+    _setRoomMetaForTest({ name: "proj#2", cwd: process.cwd() });
+    const path = sessionFile("ephemeral");
+    h.callSupervisor.mockResolvedValue({
+      id: "room-1",
+      delivered: true,
+      response: { command: "switch_session", success: true },
+    });
+    const sender = makeSender();
+    route({ type: "session_switch", id: "sw8", session: path }, sender);
+    await vi.waitFor(() => expect(sender.sent).toHaveLength(1));
+    expect(sender.last()).toMatchObject({ type: "action_ok", action: "session_switch" });
+    expect(h.callSupervisor).toHaveBeenCalledWith({
+      op: "rpc",
+      id: roomIdFor(process.cwd(), "proj#2"),
+      pid: process.pid,
+      command: { type: "switch_session", sessionPath: path },
+    });
+    // The regression pin: the address is a room_id, never the cwd-only
+    // daemon id the pre-fix code sent (which addressed the source room).
+    const sentId = (h.callSupervisor.mock.calls[0]?.[0] as { id?: unknown }).id;
+    expect(sentId).not.toBe(daemonIdForCwd(process.cwd()));
   });
 
   test("daemon room: the child's rejection text is surfaced", async () => {

@@ -1706,6 +1706,13 @@ export function _setLastKnownSessionFileForTest(file: string | null): void {
   _lastKnownSessionFile = file;
 }
 
+/** Test-only: set (or clear) the room meta the extension announces. */
+export function _setRoomMetaForTest(
+  meta: Pick<NonNullable<typeof _myRoomMeta>, "name" | "cwd"> | null,
+): void {
+  _myRoomMeta = meta ? { ...meta } : null;
+}
+
 /**
  * Persist a model change to the PROJECT settings (`<cwd>/.pi/settings.json`) so
  * a model picked from the app survives a Pi/daemon restart. `pi.setModel` only
@@ -6052,8 +6059,21 @@ function _commandChannelAvailable(): boolean {
  * the same one cron already delivers prompts through (plan/39).
  */
 async function _callDaemonRpc(command: RpcCommandWire): Promise<RpcResponseWire | undefined> {
-  const id = daemonIdForCwd(process.cwd());
-  const data = await callSupervisor({ op: "rpc", id, command });
+  // Ephemeral (phone-forked) rooms live in the supervisor's `ephemeral`
+  // map keyed by relay room_id — NEVER in the registry `children` map a
+  // cwd-only daemon id would hit. Without the branch below, every RPC
+  // action of a fork room (session picker, `/extension` commands) would be
+  // delivered to the cwd's registry daemon — the SOURCE room's process:
+  // a `switch_session` picked in a fork replaced the other room's live
+  // conversation. The own-pid hint lets the supervisor route authoritively
+  // even when the announced name drifted from the predicted one (the cwd
+  // lock may land on a neighbouring `#N`).
+  const isEphemeral = process.env["REMOTE_PI_EPHEMERAL"] === "1";
+  const cwd = _myRoomMeta?.cwd ?? process.cwd();
+  const id = isEphemeral
+    ? roomIdFor(cwd, _myRoomMeta?.name ?? _displayName(cwd))
+    : daemonIdForCwd(cwd);
+  const data = await callSupervisor({ op: "rpc", id, command, pid: process.pid });
   if (!data.delivered) throw new Error("the daemon process is not accepting commands");
   const response = data.response;
   if (response && response.success === false && response.error) throw new Error(response.error);

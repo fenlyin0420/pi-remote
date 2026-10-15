@@ -61,10 +61,13 @@ export declare class Supervisor {
     private _opRestartAll;
     private _opSend;
     /**
-     * Forwards one Pi RPC command to a daemon's stdin and (by default) waits for
-     * the child's matching `response` line, so a rejection (unknown RPC type,
-     * preflight failure such as "no model selected") travels back to the caller
-     * as real text instead of a silent no-op.
+     * Forwards one Pi RPC command to a child's stdin (registry daemon or
+     * ephemeral phone-forked room) and (by default) waits for the child's
+     * matching `response` line, so a rejection (unknown RPC type, preflight
+     * failure such as "no model selected") travels back to the caller as real
+     * text instead of a silent no-op. The reply echoes the RESOLVED child's
+     * id (`slot.id`), not the requested one — for an ephemeral room the pid
+     * path may resolve a different slot than the (predicted) id asked for.
      *
      * `RPC_PASSTHROUGH` is the whole authority model here: the supervisor only
      * forwards commands on that list, so a bug in one caller cannot reach
