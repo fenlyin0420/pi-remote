@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, unlinkSync } from "node:fs";
 import { createConnection, createServer } from "node:net";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -241,6 +241,7 @@ export class Supervisor {
             case "unregister": return this._opUnregister(req.id);
             case "spawn": return this._opSpawn(req);
             case "kill": return this._opKill(req);
+            case "rekey_ephemeral": return this._opRekeyEphemeral(req);
             case "cron_add": return this._opCronAdd(req);
             case "cron_list": return this._opCronList();
             case "cron_remove": return this._opCronRemove(req.job_id);
@@ -523,12 +524,59 @@ export class Supervisor {
                 }
             }
         }
-        if (!slot)
+        if (!slot) {
+            // A kill with a name is a phone delete of an ephemeral room. A miss
+            // there means the room will "come back" after the app drops its tile
+            // (the delete's action_ok-on-noop path) — make that observable in the
+            // journal instead of silent. Daemon/TUI deletes (no name) stay quiet.
+            if (req.name !== undefined) {
+                process.stderr.write(`[remote-pi-supervisord] kill missed: no ephemeral room (cwd=${req.cwd ?? "?"} name=${req.name}) — the rekey may not have landed\n`);
+            }
             return { ok: true, data: { killed: false } };
+        }
         if (slot.child.state === "running")
             await slot.child.stop();
         this.ephemeral.delete(slot.id);
         return { ok: true, data: { killed: true } };
+    }
+    /** Re-key an ephemeral slot to the name its child's cwd lock actually
+     *  landed on (may be a neighbouring `#N` vs the predicted one). Matched by
+     *  the calling child's pid — the only key both sides share: the slot's
+     *  stored id/name may still be the prediction. Idempotent: unknown pid or
+     *  unchanged name → `rekeyed: false`, not an error. */
+    _opRekeyEphemeral(req) {
+        const pidOk = typeof req.pid === "number" && Number.isInteger(req.pid) && req.pid > 0;
+        // The reported cwd is ALSO matched (via realpath, so spelling/case
+        // divergences don't matter): the new room id is computed from the
+        // CALLER's cwd string, so a divergent cwd would re-key the slot to an id
+        // no one uses and make the room unkillable by id and by (cwd, name).
+        const real = (p) => {
+            try {
+                return realpathSync(p);
+            }
+            catch {
+                return p;
+            }
+        };
+        let slot;
+        if (pidOk) {
+            for (const s of this.ephemeral.values()) {
+                if (s.child.pid === req.pid && real(s.cwd) === real(req.cwd)) {
+                    slot = s;
+                    break;
+                }
+            }
+        }
+        if (!slot)
+            return { ok: true, data: { rekeyed: false } };
+        const newId = roomIdFor(req.cwd, req.name);
+        if (newId === slot.id)
+            return { ok: true, data: { rekeyed: false } };
+        this.ephemeral.delete(slot.id);
+        slot.id = newId;
+        slot.name = req.name;
+        this.ephemeral.set(newId, slot);
+        return { ok: true, data: { rekeyed: true } };
     }
     _spawnEphemeral(roomId, cwd, name) {
         // Replace a stale slot (e.g. a starting child that is about to be
@@ -565,14 +613,23 @@ export class Supervisor {
             name,
         };
         this.ephemeral.set(roomId, slot);
-        child.on("exit", (evt) => this._onEphemeralExit(roomId, evt));
+        // Identity-based binding: the slot may be re-keyed (renamed) after
+        // spawn, so the exit handler resolves the slot by child instance, not
+        // by the room id that was current at binding time.
+        child.on("exit", (evt) => this._onEphemeralExit(child, evt));
         child.spawn();
     }
     /** Ephemeral rooms never auto-restart: a crash is a drop, with a log line
      *  so the owner can see why the tile went away. */
-    _onEphemeralExit(roomId, evt) {
-        const slot = this.ephemeral.get(roomId);
-        if (!slot)
+    _onEphemeralExit(child, evt) {
+        let roomId;
+        for (const [id, s] of this.ephemeral) {
+            if (s.child === child) {
+                roomId = id;
+                break;
+            }
+        }
+        if (roomId === undefined)
             return;
         this.ephemeral.delete(roomId);
         if (evt.isCrash) {

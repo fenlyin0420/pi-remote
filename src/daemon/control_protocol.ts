@@ -63,9 +63,14 @@ export type ControlRequest =
   // `kill`: stop + drop the ephemeral child holding the given relay room_id.
   // `cwd`/`name` are a fallback lookup: the child's cwd lock may land on a
   // neighbouring `#N`, so its announced room id can differ from the one the
-  // caller predicted.
+  // caller predicted. `rekey_ephemeral`: once the child's cwd lock has
+  // landed, it reports the ACTUAL name via this op; the supervisor re-keys
+  // the slot to the announced room id (matched by pid — the only key that
+  // both sides share) and updates `slot.name`, so a later `kill`/`rpc`
+  // addressed by the announced id finds the slot.
   | { op: "spawn"; cwd: string; name?: string }
   | { op: "kill"; room_id: string; cwd?: string; name?: string }
+  | { op: "rekey_ephemeral"; pid: number; cwd: string; name: string }
   // ── cron (plan/39) ──
   | { op: "cron_add"; daemon_id: string; schedule: string; prompt: string; tz?: string; skip_if_busy?: boolean; wake?: boolean; catchup?: boolean }
   | { op: "cron_list" }
@@ -98,6 +103,7 @@ export interface ControlReplyShapes {
   unregister: { removed: boolean; cwd?: string };
   spawn: { room_id: string; started: boolean; name: string };
   kill: { killed: boolean };
+  rekey_ephemeral: { rekeyed: boolean };
   // ── cron (plan/39) ──
   cron_add: { job: CronJobView };
   cron_list: { jobs: CronJobView[] };

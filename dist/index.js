@@ -3461,6 +3461,39 @@ async function _cmdRootInner(ctx, rootLifecycleGeneration) {
                 _cwdLock = result;
                 _lockedName = candidate;
                 _cancelLockWait();
+                if (isEphemeral) {
+                    // The slot the supervisor keyed at spawn time may carry the
+                    // PREDICTED name (the app's `#N` guess); report where the lock
+                    // actually landed so it re-keys to the announced room id —
+                    // otherwise a later `room_delete` (keyed by the announced name)
+                    // misses the slot and the room silently comes back after the app
+                    // drops its tile. There is NO server-side fallback that recovers
+                    // a lost rekey (the slot's stored name is the prediction), so
+                    // retry with backoff and log the failure to stderr (the headless
+                    // ui forwards it to the supervisor journal) instead of
+                    // swallowing it.
+                    void (async () => {
+                        for (let attempt = 1; attempt <= 3; attempt++) {
+                            try {
+                                await callSupervisor({
+                                    op: "rekey_ephemeral",
+                                    pid: process.pid,
+                                    cwd,
+                                    name: candidate,
+                                });
+                                return;
+                            }
+                            catch {
+                                if (attempt === 3) {
+                                    process.stderr.write(`[remote-pi] rekey_ephemeral failed (pid=${process.pid} name=${candidate}) — room_delete may miss this room\n`);
+                                }
+                                else {
+                                    await new Promise((r) => setTimeout(r, 300 * attempt));
+                                }
+                            }
+                        }
+                    })();
+                }
                 break;
             }
         }

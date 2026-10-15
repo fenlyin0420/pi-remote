@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
-import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createConnection } from "node:net";
 import { join } from "node:path";
@@ -61,7 +61,11 @@ beforeEach(async () => {
     "#!/bin/sh\n" +
     "case \"$PWD\" in\n" +
     "*.crash*) exit 1;;\n" +
-    "*) exec sleep 3600;;\n" +
+    // Record the child's own pid so tests can address it (rekey_ephemeral
+    // is matched by pid, like the real child's lock report). A
+    // `.pi-fake-die` marker makes the child write its pid, run for 3s, then
+    // crash — a late exit for exercising the re-keyed-slot drop path.
+    "*) echo $$ > \"$PWD/.pi-fake-pid\"; if [ -f \"$PWD/.pi-fake-die\" ]; then sleep 3; exit 1; fi; exec sleep 3600;;\n" +
     "esac\n",
   );
   chmodSync(fakePi, 0o755);
@@ -109,6 +113,104 @@ describe("Supervisor — ephemeral (phone) rooms", () => {
       expect(r.data!.name).toBe(defaultAgentName(tmp));
       expect(r.data!.room_id).toBe(roomIdFor(tmp, defaultAgentName(tmp)));
     }
+  });
+
+  test("rekey_ephemeral: kill by the ANNOUNCED name succeeds after the lock re-lands (regression: a deleted fork room came back, because the slot was still keyed by the PREDICTED name the app had guessed)", async () => {
+    const tmp = mkdtempSync(join(tmpdir(), "pi-sv-eph-rekey-"));
+    const spawn = await ask({ op: "spawn", cwd: tmp, name: "proj#3" }) as ControlReply<{ room_id: string; started: boolean }>;
+    expect(spawn.ok).toBe(true);
+    if (!spawn.ok) return;
+    const pidFile = join(tmp, ".pi-fake-pid");
+    for (let i = 0; i < 50 && !existsSync(pidFile); i++) await sleep(50);
+    expect(existsSync(pidFile)).toBe(true);
+    const pid = Number(readFileSync(pidFile, "utf8").trim());
+    // Before the rekey lands, a kill addressed by the announced name (#2)
+    // misses: the slot is still keyed by the predicted #3 — the exact race
+    // window that made deleted rooms reappear.
+    const earlyKill = await ask({ op: "kill", room_id: roomIdFor(tmp, "proj#2"), cwd: tmp, name: "proj#2" }) as ControlReply<{ killed: boolean }>;
+    expect(earlyKill.ok && earlyKill.data!.killed).toBe(false);
+    // The child's cwd lock landed on #2 → it reports the actual name.
+    const rekey = await ask({ op: "rekey_ephemeral", pid, cwd: tmp, name: "proj#2" }) as ControlReply<{ rekeyed: boolean }>;
+    expect(rekey.ok).toBe(true);
+    if (rekey.ok) expect(rekey.data!.rekeyed).toBe(true);
+    // ...and the same kill now finds the slot.
+    const kill = await ask({ op: "kill", room_id: roomIdFor(tmp, "proj#2"), cwd: tmp, name: "proj#2" }) as ControlReply<{ killed: boolean }>;
+    expect(kill.ok && kill.data!.killed).toBe(true);
+    // Idempotent: a repeat kill reports killed:false, not an error.
+    const again = await ask({ op: "kill", room_id: roomIdFor(tmp, "proj#2"), cwd: tmp, name: "proj#2" }) as ControlReply<{ killed: boolean }>;
+    expect(again.ok && again.data!.killed).toBe(false);
+  });
+
+  test("rekey_ephemeral: unknown pid or unchanged name is a no-op (rekeyed: false)", async () => {
+    const unknown = await ask({ op: "rekey_ephemeral", pid: 99999999, cwd: "/x", name: "n" }) as ControlReply<{ rekeyed: boolean }>;
+    expect(unknown.ok).toBe(true);
+    if (unknown.ok) expect(unknown.data!.rekeyed).toBe(false);
+    const tmp = mkdtempSync(join(tmpdir(), "pi-sv-eph-rekey-nop-"));
+    const spawn = await ask({ op: "spawn", cwd: tmp, name: "proj" }) as ControlReply<{ room_id: string }>;
+    expect(spawn.ok).toBe(true);
+    if (!spawn.ok) return;
+    const pidFile = join(tmp, ".pi-fake-pid");
+    for (let i = 0; i < 50 && !existsSync(pidFile); i++) await sleep(50);
+    const pid = Number(readFileSync(pidFile, "utf8").trim());
+    const same = await ask({ op: "rekey_ephemeral", pid, cwd: tmp, name: "proj" }) as ControlReply<{ rekeyed: boolean }>;
+    expect(same.ok).toBe(true);
+    if (same.ok) expect(same.data!.rekeyed).toBe(false);
+  });
+
+  test("rekey_ephemeral: with several rooms in one cwd, the pid pins exactly one slot — siblings are untouched", async () => {
+    const tmp = mkdtempSync(join(tmpdir(), "pi-sv-eph-rekey-multi-"));
+    const a = await ask({ op: "spawn", cwd: tmp, name: "proj#2" }) as ControlReply<{ room_id: string }>;
+    expect(a.ok).toBe(true);
+    if (!a.ok) return;
+    const pidFile = join(tmp, ".pi-fake-pid");
+    for (let i = 0; i < 50 && !existsSync(pidFile); i++) await sleep(50);
+    const pidA = Number(readFileSync(pidFile, "utf8").trim());
+    rmSync(pidFile);
+    const b = await ask({ op: "spawn", cwd: tmp, name: "proj#3" }) as ControlReply<{ room_id: string }>;
+    expect(b.ok).toBe(true);
+    if (!b.ok) return;
+    for (let i = 0; i < 50 && !existsSync(pidFile); i++) await sleep(50);
+    const pidB = Number(readFileSync(pidFile, "utf8").trim());
+    // Re-key room A's child (by pid) to a third, announced name.
+    const rekey = await ask({ op: "rekey_ephemeral", pid: pidA, cwd: tmp, name: "proj#1" }) as ControlReply<{ rekeyed: boolean }>;
+    expect(rekey.ok).toBe(true);
+    if (rekey.ok) expect(rekey.data!.rekeyed).toBe(true);
+    // The re-keyed room is killable by its announced id...
+    const killA = await ask({ op: "kill", room_id: roomIdFor(tmp, "proj#1"), cwd: tmp, name: "proj#1" }) as ControlReply<{ killed: boolean }>;
+    expect(killA.ok && killA.data!.killed).toBe(true);
+    // ...and room B's slot survived under its original predicted id/name.
+    const killB = await ask({ op: "kill", room_id: roomIdFor(tmp, "proj#3"), cwd: tmp, name: "proj#3" }) as ControlReply<{ killed: boolean }>;
+    expect(killB.ok && killB.data!.killed).toBe(true);
+    // (pidB was never used in a rekey — it only proves the two slots kept
+    // distinct children; assert the B-slot identity assumption holds.)
+    expect(pidB).toBeGreaterThan(0);
+  });
+
+  test("a re-keyed slot is dropped by child identity on exit (not by the stale room id)", async () => {
+    const tmp = mkdtempSync(join(tmpdir(), "pi-sv-eph-die-"));
+    writeFileSync(join(tmp, ".pi-fake-die"), "");
+    const spawn = await ask({ op: "spawn", cwd: tmp, name: "proj#2" }) as ControlReply<{ room_id: string }>;
+    expect(spawn.ok).toBe(true);
+    if (!spawn.ok) return;
+    const pidFile = join(tmp, ".pi-fake-pid");
+    for (let i = 0; i < 50 && !existsSync(pidFile); i++) await sleep(50);
+    const pid = Number(readFileSync(pidFile, "utf8").trim());
+    const rekey = await ask({ op: "rekey_ephemeral", pid, cwd: tmp, name: "proj#1" }) as ControlReply<{ rekeyed: boolean }>;
+    expect(rekey.ok).toBe(true);
+    if (rekey.ok) expect(rekey.data!.rekeyed).toBe(true);
+    // The child crashes 3s after start. Poll (re-keying to yet another name:
+    // rekeyed:true while the slot is alive, rekeyed:false once the identity
+    // scan finds no slot for the dead child)...
+    let dropped = false;
+    for (let i = 0; i < 50 && !dropped; i++) {
+      const probe = await ask({ op: "rekey_ephemeral", pid, cwd: tmp, name: "proj#0" }) as ControlReply<{ rekeyed: boolean }>;
+      dropped = probe.ok && probe.data!.rekeyed === false;
+      if (!dropped) await sleep(200);
+    }
+    expect(dropped).toBe(true);
+    // ...so the room is gone under its re-keyed id too.
+    const kill = await ask({ op: "kill", room_id: roomIdFor(tmp, "proj#1"), cwd: tmp, name: "proj#1" }) as ControlReply<{ killed: boolean }>;
+    expect(kill.ok && kill.data!.killed).toBe(false);
   });
 
   test("spawn is idempotent for an already-running (cwd, name) room", async () => {

@@ -70,6 +70,11 @@ export type ControlRequest = {
     cwd?: string;
     name?: string;
 } | {
+    op: "rekey_ephemeral";
+    pid: number;
+    cwd: string;
+    name: string;
+} | {
     op: "cron_add";
     daemon_id: string;
     schedule: string;
@@ -164,6 +169,9 @@ export interface ControlReplyShapes {
     };
     kill: {
         killed: boolean;
+    };
+    rekey_ephemeral: {
+        rekeyed: boolean;
     };
     cron_add: {
         job: CronJobView;

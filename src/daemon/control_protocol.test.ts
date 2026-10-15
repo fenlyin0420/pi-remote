@@ -25,6 +25,9 @@ describe("control_protocol — request/reply framing", () => {
       { op: "rpc", id: "abc12345", command: { type: "get_state" }, timeout_ms: 5000, pid: 4242 },
       { op: "register", cwd: "/Users/x/Movies" },
       { op: "unregister", id: "abc12345" },
+      { op: "spawn", cwd: "/Users/x/Movies", name: "proj#2" },
+      { op: "kill", room_id: "abc12345", cwd: "/Users/x/Movies", name: "proj#2" },
+      { op: "rekey_ephemeral", pid: 4242, cwd: "/Users/x/Movies", name: "proj#2" },
     ];
     for (const req of ops) {
       const wire = encodeRequest(req);

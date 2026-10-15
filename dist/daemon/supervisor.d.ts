@@ -92,6 +92,12 @@ export declare class Supervisor {
      * `killed: false`, not an error.
      */
     private _opKill;
+    /** Re-key an ephemeral slot to the name its child's cwd lock actually
+     *  landed on (may be a neighbouring `#N` vs the predicted one). Matched by
+     *  the calling child's pid — the only key both sides share: the slot's
+     *  stored id/name may still be the prediction. Idempotent: unknown pid or
+     *  unchanged name → `rekeyed: false`, not an error. */
+    private _opRekeyEphemeral;
     private _spawnEphemeral;
     /** Ephemeral rooms never auto-restart: a crash is a drop, with a log line
      *  so the owner can see why the tile went away. */
