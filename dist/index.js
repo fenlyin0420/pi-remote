@@ -1180,6 +1180,7 @@ export function _handleUploadStart(sender, msg) {
         lastSeenAt: startedAt,
         sender,
     });
+    console.error(`[remote-pi] upload ${msg.id} started: ${msg.name} (${msg.size} bytes)`);
 }
 export function _handleUploadChunk(sender, msg) {
     const session = _uploadIdValid(msg.id) ? _uploadSessions.get(msg.id) : undefined;
@@ -1187,7 +1188,11 @@ export function _handleUploadChunk(sender, msg) {
         // Answer every time: after a daemon restart (or a TTL reap) the app would
         // otherwise keep streaming the rest of the file into a dead session.
         console.error(`[remote-pi] upload_chunk for unknown session ${typeof msg.id === "string" ? msg.id : "<malformed>"}`);
-        sender.send({ type: "error", code: "invalid_message", in_reply_to: _replyId(msg.id), message: "upload_chunk: unknown session" });
+        // Distinct code (not invalid_message): the app's session was lost by a
+        // relay/transport drop between start and this chunk — a TRANSIENT
+        // condition the app must recover by restarting the whole upload, not a
+        // protocol violation the app would treat as final.
+        sender.send({ type: "error", code: "upload_session_lost", in_reply_to: _replyId(msg.id), message: "upload_chunk: unknown session" });
         return;
     }
     if (session.sender !== sender) {
@@ -1249,7 +1254,7 @@ function _sha256OfFile(path) {
 export async function _handleUploadDone(sender, msg) {
     const session = _uploadIdValid(msg.id) ? _uploadSessions.get(msg.id) : undefined;
     if (!session) {
-        _failUpload(sender, undefined, _replyId(msg.id), "invalid_message", "upload_done: unknown session");
+        _failUpload(sender, undefined, _replyId(msg.id), "upload_session_lost", "upload_done: unknown session");
         return;
     }
     if (session.sender !== sender) {
@@ -2256,6 +2261,7 @@ function _onRelayClose(closedRelay) {
         return; // delayed close from a replaced Relay
     if (_state === "idle")
         return; // already torn down (e.g. /remote-pi stop)
+    console.error(`[remote-pi] relay WS closed unexpectedly (state=${_state}) — scheduling reconnect`);
     _relayLifecycleGeneration += 1;
     _stopAutoListener?.();
     _stopAutoListener = null;
@@ -2271,6 +2277,21 @@ function _onRelayClose(closedRelay) {
     if (_queuedItems.length > 0)
         _resetQueuedItems({ broadcast: true });
     _activePeers.clear();
+    // In-flight uploads die with the relay: the app's channel is gone, so the
+    // session state and half-written `.part` are meaningless. Reap them so a
+    // reconnected upload never meets a stale entry — the app restarts the
+    // whole transfer (its ack timeout fires on the dead transport).
+    const reapedUploads = _uploadSessions.size;
+    for (const s of _uploadSessions.values()) {
+        try {
+            unlinkSync(s.partPath);
+        }
+        catch { /* already gone */ }
+    }
+    _uploadSessions.clear();
+    if (reapedUploads > 0) {
+        console.error(`[remote-pi] relay close reaped ${reapedUploads} in-flight upload session(s)`);
+    }
     _peerShort = "";
     _currentTurnId = null;
     _pendingSteers = [];
@@ -2353,6 +2374,7 @@ async function _attemptReconnect(lifecycleGeneration, url) {
     }
     _relay = relay;
     _reconnectAttempt = 0;
+    console.error(`[remote-pi] relay WS reconnected`);
     relay.on("close", () => _onRelayClose(relay));
     _stopAutoListener = _installAutoListener(relay);
     // Plan/25 Wave B/C: relay is back; bring cross-PC routing back online.

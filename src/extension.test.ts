@@ -2211,7 +2211,7 @@ describe("multi-channel broadcast (W2D)", () => {
         { type: "upload_done", id: "up-ooo12345", sha256: createHash("sha256").update(bytes).digest("hex") },
       ]);
       expect(sent.find((d) => d.inner.code === "upload_rejected")).toBeDefined();
-      expect(sent.find((d) => d.inner.code === "invalid_message")).toBeDefined(); // done after cancel → unknown session
+      expect(sent.find((d) => d.inner.code === "upload_session_lost")).toBeDefined(); // done after cancel → unknown session
       expect(sent.find((d) => d.inner.type === "upload_complete")).toBeUndefined();
     } finally {
       _resetUploadSessionsForTest();
@@ -2291,7 +2291,7 @@ describe("multi-channel broadcast (W2D)", () => {
       const sent = await _runUpload([
         { type: "upload_chunk", id: "up-unknown1", index: 0, data: Buffer.from("hi").toString("base64") },
       ]);
-      const err = sent.find((d) => d.inner.type === "error" && d.inner.code === "invalid_message");
+      const err = sent.find((d) => d.inner.type === "error" && d.inner.code === "upload_session_lost");
       expect(err?.inner.in_reply_to).toBe("up-unknown1");
     } finally {
       _resetUploadSessionsForTest();
