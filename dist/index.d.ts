@@ -60,6 +60,26 @@ declare let _myRoomMeta: {
 export declare function _resetPendingToolImagesForTest(): void;
 /** Test seam: land uploads in a temp dir instead of `~/.pi/remote/uploads`. */
 export declare function _setUploadDirForTest(dir?: string): void;
+export declare function _handleUploadStart(sender: PlainPeerChannel, msg: {
+    id: string;
+    name: string;
+    size: number;
+}): void;
+export declare function _handleUploadChunk(sender: PlainPeerChannel, msg: {
+    id: string;
+    index: number;
+    data: string;
+}): void;
+export declare function _handleUploadDone(sender: PlainPeerChannel, msg: {
+    id: string;
+    sha256: string;
+}): Promise<void>;
+/** Reap stalled sessions: idle for >[UPLOAD_IDLE_MS], or started >[UPLOAD_TTL_MS] ago. */
+export declare function _sweepUploads(): void;
+/** Test-only: drop in-flight sessions without touching the part files. */
+export declare function _resetUploadSessionsForTest(): void;
+/** Periodic TTL sweep; started once (unref'd — never holds the process open). */
+export declare function _startUploadSweep(): void;
 type BufferMsg = {
     role: "user" | "assistant" | "toolResult" | string;
     content?: unknown;

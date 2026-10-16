@@ -446,7 +446,9 @@ ClientMessage `user_message` ganha `files?`:
 ```
 
 `WireFile = { name: string, text?: string, path?: string }` — `text` só no
-sentido App→Pi; `path` só no sentido Pi→App (o conteúdo nunca volta). O echo
+sentido App→Pi (o conteúdo nunca volta); `path` carrega a referência App→Pi
+do upload de binário (Plan/62) e o caminho no sentido Pi→App (echo/
+histórico). O echo
 ServerMessage `user_message` carrega `files` com o nome + caminho, e o evento
 `user_input` do `session_history` também, pra cada device renderizar o mesmo
 chip.
@@ -472,6 +474,70 @@ estado paralelo.
 Nenhuma: `vision` gateia só imagem. Arquivo de texto funciona em qualquer
 modelo, então o app mantém o anexo alcançável e desabilita apenas as opções
 Câmera / Galeria quando o modelo ativo não aceita imagem.
+
+---
+
+## Upload de binário em pedaços (Plan/62)
+
+PDF, Office, zip e os demais binários não cabem num envelope de 4 MiB (nem
+como texto), então viajam em pedaços de base64, cada um abaixo do teto do
+relay. O app abre uma sessão (`upload_start`), envia os pedaços
+(`upload_chunk` ×N) e fecha com o hash (`upload_done`). O Pi recebe o
+arquivo, verifica tamanho + sha256 e só então responde o caminho — depois a
+mensagem `user_message` carrega apenas a referência `{ name, path }`, sem
+bytes.
+
+### Wire
+
+```jsonc
+{ "type": "upload_start",  "id": "up-abc12345", "name": "doc.pdf", "size": 262144000 }
+{ "type": "upload_chunk",  "id": "up-abc12345", "index": 0, "data": "<base64 de até 2 MiB>" }
+{ "type": "upload_done",   "id": "up-abc12345", "sha256": "<hex 64>" }
+
+// Pi → app, ao concluir:
+{ "type": "upload_complete", "in_reply_to": "up-abc12345", "id": "up-abc12345",
+  "name": "doc.pdf", "path": "/home/p/.pi/remote/uploads/<room>/doc.pdf" }
+```
+
+Falhas (`tamanho estourado`, `hash divergente`, `pedaço fora de ordem`,
+sessão desconhecida — também no `upload_chunk`, com resposta em todo caso —
+e `4ª sessão` com o teto de 3 concorrentes) usam o frame `error` existente
+(`code` `upload_too_large` / `upload_hash_mismatch` / `upload_rejected` /
+`upload_size_mismatch` / `invalid_message`) e matam a sessão + o arquivo
+parcial. Erros de disco são `internal_error`. O app interrompe a transmissão
+assim que recebe um `error` endereçado à sessão.
+
+### Mapeamento pro modelo
+
+Mesma regra do upload de texto: os bytes já estão no disco do Pi
+(`<home>/.pi/remote/uploads/<room_id>/<nome>`, nome sanitizado, reenvio
+idêntico reusa o arquivo pelo hash, diferente ganha sufixo `-1`, `-2`, …) e
+o prompt recebe só a linha de aviso `[Uploaded file: … → …]` — o mapper de
+histórico reconstrói o chip da mesma forma que no upload de texto.
+
+### Teto: por que 250 MiB e pedaços de 2 MiB
+
+- **Pedaço = 2 MiB**: base64 dá ~2.7 MiB no JSON interno, `ct` fica em
+  ~3.7 MiB — dentro do teto de 4 MiB com folga de 11%.
+- **Arquivo = 250 MiB** (~125 pedaços): teto prático de transferência pelo
+  celular; o daemon aceita o mesmo teto e o app reusa a mesma constante.
+- **Sessão**: `id` gerado pelo app (`^[A-Za-z0-9_-]{8,64}$`, também vira o
+  nome do arquivo parcial), `size` > 0, `sha256` em hex minúsculo.
+- **Concorrência**: 3 sessões por Pi; a `upload_start` seguinte é respondida
+  com `upload_rejected` — o app só tenta de novo quando uma terminar.
+- **Reap**: sessão ociosa por 2 min (sem pedaço) ou com 1 h de duração é
+  removida (arquivo parcial excluído). Se o daemon morrer no meio, os pedaços
+  órfãos são varridos no próximo `upload_start` (com 1 h de idade).
+- Sem P2P nem storage: o relay continua opaco para o app↔Pi — as novas frames
+  são JSON comum no envelope existente, sem mudança no relay.
+- `index` é seqüencial e o Pi exige a ordem (o WebSocket já garante; a
+  checagem é defesa em segundo grau). Sem retomada de pedaço: uma queda
+  reinicia o upload inteiro.
+
+### Capacidade do modelo
+
+Nenhuma: o agente só recebe o caminho, igual ao upload de texto — qualquer
+modelo aceita.
 
 ---
 

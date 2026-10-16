@@ -185,6 +185,15 @@ export type ClientMessage =
       files?: WireFile[];
       streaming_behavior?: StreamingBehavior;
     }
+  // Plan/62 — chunked binary upload (files too large or not text: PDF, Office
+  // docs, archives, ...). The app streams the file as base64 chunks, each
+  // envelope staying under the relay's 4 MiB `ct` ceiling; the Pi reassembles
+  // and lands it under its uploads dir, answering with an absolute path.
+  // `index` is the 0-based chunk position — WebSocket ordering makes it
+  // redundant for correctness but the Pi enforces it sequentially anyway.
+  | { type: "upload_start"; id: string; name: string; size: number }
+  | { type: "upload_chunk"; id: string; index: number; data: string }
+  | { type: "upload_done"; id: string; sha256: string }
   | { type: "queued_message_set"; id: string; text: string }
   | { type: "queued_message_clear"; id: string; target_id?: string }
   // Pi → App file pull. The app asks for bytes it does not have yet (a card
@@ -466,6 +475,8 @@ export type ServerMessage =
       error?: string;
       diff?: string;
     }
+  // Plan/62 — confirms a completed chunked upload: where the file landed.
+  | { type: "upload_complete"; in_reply_to: string; id: string; name: string; path: string }
   | { type: "error"; in_reply_to?: string; code: ErrorCode; message: string }
   | { type: "cancelled"; in_reply_to: string; target_id: string }
   | { type: "pong"; in_reply_to: string }

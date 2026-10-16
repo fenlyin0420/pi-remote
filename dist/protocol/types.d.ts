@@ -141,6 +141,20 @@ export type ClientMessage = {
     files?: WireFile[];
     streaming_behavior?: StreamingBehavior;
 } | {
+    type: "upload_start";
+    id: string;
+    name: string;
+    size: number;
+} | {
+    type: "upload_chunk";
+    id: string;
+    index: number;
+    data: string;
+} | {
+    type: "upload_done";
+    id: string;
+    sha256: string;
+} | {
     type: "queued_message_set";
     id: string;
     text: string;
@@ -441,6 +455,12 @@ export type ServerMessage = {
     result?: unknown;
     error?: string;
     diff?: string;
+} | {
+    type: "upload_complete";
+    in_reply_to: string;
+    id: string;
+    name: string;
+    path: string;
 } | {
     type: "error";
     in_reply_to?: string;

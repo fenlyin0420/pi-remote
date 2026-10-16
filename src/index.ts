@@ -138,9 +138,9 @@ import {
 import { firstUserMessageForSession } from "./session/first_message.js";
 import { runSetupWizard, type WizardUI } from "./session/setup_wizard.js";
 import { updateFooter, type FooterState } from "./ui/footer.js";
-import { join, isAbsolute, dirname, resolve, basename } from "node:path";
+import { join, isAbsolute, dirname, resolve, basename, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { chmodSync, mkdtempSync, mkdirSync, copyFileSync, existsSync, unlinkSync, readFileSync, writeFileSync, realpathSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, copyFileSync, existsSync, unlinkSync, readFileSync, renameSync, writeFileSync, realpathSync, readdirSync, statSync, createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
 import { spawnSync } from "node:child_process";
 import { hostname, homedir, tmpdir } from "node:os";
@@ -1159,7 +1159,15 @@ function _uniqueUploadPath(dir: string, name: string, text: string): string {
   try {
     if (readFileSync(first, "utf8") === text) return first;
   } catch { /* unreadable → fall through and pick a fresh name */ }
-  const dot = name.lastIndexOf(".");
+  return _freshUploadPath(dir, name);
+}
+
+/**
+ * Suffix ladder shared by the text-content and hash idempotency checks:
+ * `name`, `name-1.ext`, `name-2.ext`, … `name-<timestamp>.ext`.
+ */
+function _freshUploadPath(dir: string, name: string): string {
+  const dot = name.lastIndexOf(".")
   const stem = dot > 0 ? name.slice(0, dot) : name;
   const ext = dot > 0 ? name.slice(dot) : "";
   for (let i = 1; i < 1000; i += 1) {
@@ -1182,8 +1190,27 @@ function _landUploadedFiles(msg: ClientUserMessage): WireFile[] {
   const dir = join(_uploadRootDir(), room);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const landed: WireFile[] = [];
+  const uploadsRoot = join(_uploadRootDir(), room) + sep;
   for (const file of files) {
-    if (!file || typeof file.text !== "string") {
+    if (!file) {
+      console.error(`[remote-pi] skipped malformed upload id=${msg.id}`);
+      continue;
+    }
+    // Plan/62: chunked-upload reference — the bytes already arrived over the
+    // `upload_*` frames and were verified + renamed by the Pi. We compare the
+    // RESOLVED path (symlinks and `..` included) against this room's upload
+    // dir and require the file to exist, so a forged `path` can never point
+    // the agent at an arbitrary file.
+    if (typeof file.path === "string" && file.text === undefined) {
+      const resolved = resolve(file.path);
+      if (!resolved.startsWith(uploadsRoot) || !existsSync(resolved)) {
+        console.error(`[remote-pi] rejected out-of-dir upload ref id=${msg.id}: ${file.path}`);
+        continue;
+      }
+      landed.push({ name: _safeUploadName(file.name), path: resolved });
+      continue;
+    }
+    if (typeof file.text !== "string") {
       console.error(`[remote-pi] skipped malformed upload id=${msg.id}`);
       continue;
     }
@@ -1197,6 +1224,275 @@ function _landUploadedFiles(msg: ClientUserMessage): WireFile[] {
 
 function _uploadNotice(file: WireFile): string {
   return `${UPLOAD_NOTICE_PREFIX}${file.name} → ${file.path ?? ""}]\n`;
+}
+
+// ── Chunked binary upload (app → Pi) — Plan/62 ────────────────────────────
+//
+// Files that are neither text nor images (PDF, Office docs, archives, …) do
+// not fit a single 4 MiB envelope, so the app streams them as base64 chunks
+// (`upload_start` → `upload_chunk`* → `upload_done`). Each chunk's envelope
+// stays under the relay's `ct` ceiling (2 MiB of bytes → ~3.7 MiB of `ct`).
+// The Pi reassembles into `<uploads>/<room>/<id>.part`, verifies the declared
+// size + sha256, and renames with the same idempotency rules as the inline
+// text path (identical content reuses the existing file). The message that
+// references the file then carries `{ name, path }` — no bytes.
+//
+// WebSocket ordering already guarantees in-order chunks; the sequential
+// `index` check is a cheap second line of defense.
+
+/** Hard per-file ceiling, mirrored by the app's picker. */
+const UPLOAD_MAX_BYTES = 250 * 1024 * 1024;
+
+/** Largest single chunk accepted (keeps every envelope under the 4 MiB cap). */
+const UPLOAD_MAX_CHUNK_BYTES = 2 * 1024 * 1024;
+
+/** In-flight uploads kept alive concurrently. */
+const UPLOAD_MAX_CONCURRENT = 3;
+
+/** Absolute ceiling per session (from start): stuck sessions die after this. */
+const UPLOAD_TTL_MS = 60 * 60 * 1000;
+/** Idle reaper: a session whose last chunk arrived >2 min ago is dropped. */
+const UPLOAD_IDLE_MS = 2 * 60 * 1000;
+
+interface UploadSession {
+  id: string;
+  name: string;
+  size: number;
+  partPath: string;
+  nextIndex: number;
+  bytes: number;
+  startedAt: number;
+  /** Last frame (start or accepted chunk) — the idle sweep's clock. */
+  lastSeenAt: number;
+  /** The peer channel that opened the session; other senders' frames are refused. */
+  sender: PlainPeerChannel;
+}
+
+const _uploadSessions = new Map<string, UploadSession>();
+
+/** Client-generated session id: short, path-safe (it becomes the part name). */
+function _uploadIdValid(id: unknown): id is string {
+  return typeof id === "string" && /^[A-Za-z0-9_-]{8,64}$/.test(id);
+}
+
+function _uploadDir(): string {
+  const dir = join(_uploadRootDir(), _myRoomId ?? "main");
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  return dir;
+}
+
+/** Never echo a malformed (non-string) id back into `in_reply_to`. */
+function _replyId(id: unknown): string | undefined {
+  return typeof id === "string" ? id : undefined;
+}
+
+/** Drop a session (and its part file) and tell the sender why. */
+function _failUpload(
+  sender: PlainPeerChannel,
+  session: UploadSession | undefined,
+  inReplyTo: string | undefined,
+  code: string,
+  message: string,
+): void {
+  if (session) {
+    _uploadSessions.delete(session.id);
+    try { unlinkSync(session.partPath); } catch { /* already gone */ }
+    console.error(`[remote-pi] upload ${session.id} cancelled: ${code}`);
+  }
+  sender.send({ type: "error", code, in_reply_to: inReplyTo, message });
+}
+
+export function _handleUploadStart(sender: PlainPeerChannel, msg: { id: string; name: string; size: number }): void {
+  _startUploadSweep();
+  _sweepUploads();
+  if (!_uploadIdValid(msg.id)) {
+    _failUpload(sender, undefined, _replyId(msg.id), "invalid_message", "upload_start: malformed session id");
+    return;
+  }
+  if (typeof msg.size !== "number" || !Number.isInteger(msg.size) || msg.size <= 0) {
+    _failUpload(sender, undefined, _replyId(msg.id), "invalid_message", "upload_start: missing or invalid size");
+    return;
+  }
+  if (msg.size > UPLOAD_MAX_BYTES) {
+    _failUpload(sender, undefined, _replyId(msg.id), "upload_too_large", `File is too large (max ${UPLOAD_MAX_BYTES / (1024 * 1024)} MiB)`);
+    return;
+  }
+  if (_uploadSessions.size >= UPLOAD_MAX_CONCURRENT) {
+    _failUpload(sender, undefined, _replyId(msg.id), "upload_rejected", "Too many uploads in progress — wait for one to finish");
+    return;
+  }
+  _uploadSessions.delete(msg.id); // a restart can leave a stale part from a dead session
+  const dir = _uploadDir();
+  const partPath = join(dir, `${msg.id}.part`);
+  try {
+    if (existsSync(partPath)) unlinkSync(partPath);
+    writeFileSync(partPath, new Uint8Array(0), { mode: 0o600 });
+    // A daemon restart mid-upload leaves an in-memory session gone and its
+    // `.part` orphaned forever — prune part files of dead sessions past the TTL.
+    const now = Date.now();
+    for (const entry of readdirSync(dir)) {
+      if (!entry.endsWith(".part") || _uploadSessions.has(entry.slice(0, -5))) continue;
+      const orphan = join(dir, entry);
+      try {
+        if (now - statSync(orphan).mtimeMs >= UPLOAD_TTL_MS) unlinkSync(orphan);
+      } catch { /* already gone */ }
+    }
+  } catch (error) {
+    _failUpload(sender, undefined, _replyId(msg.id), "internal_error", `Could not open the upload: ${error instanceof Error ? error.message : String(error)}`);
+    return;
+  }
+  const startedAt = Date.now();
+  _uploadSessions.set(msg.id, {
+    id: msg.id,
+    name: _safeUploadName(msg.name),
+    size: msg.size,
+    partPath,
+    nextIndex: 0,
+    bytes: 0,
+    startedAt,
+    lastSeenAt: startedAt,
+    sender,
+  });
+}
+
+export function _handleUploadChunk(sender: PlainPeerChannel, msg: { id: string; index: number; data: string }): void {
+  const session = _uploadIdValid(msg.id) ? _uploadSessions.get(msg.id) : undefined;
+  if (!session) {
+    // Answer every time: after a daemon restart (or a TTL reap) the app would
+    // otherwise keep streaming the rest of the file into a dead session.
+    console.error(`[remote-pi] upload_chunk for unknown session ${typeof msg.id === "string" ? msg.id : "<malformed>"}`);
+    sender.send({ type: "error", code: "invalid_message", in_reply_to: _replyId(msg.id), message: "upload_chunk: unknown session" });
+    return;
+  }
+  if (session.sender !== sender) {
+    // Another peer must not append to (or steer) someone else's session.
+    sender.send({ type: "error", code: "upload_rejected", in_reply_to: _replyId(msg.id), message: "upload_chunk: not your session" });
+    return;
+  }
+  if (msg.index !== session.nextIndex) {
+    _failUpload(sender, session, msg.id, "upload_rejected", `Expected chunk ${session.nextIndex}, got ${msg.index}`);
+    return;
+  }
+  if (typeof msg.data !== "string" || msg.data.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(msg.data)) {
+    _failUpload(sender, session, msg.id, "invalid_message", "upload_chunk: malformed base64 payload");
+    return;
+  }
+  const decoded = Buffer.from(msg.data, "base64");
+  if (decoded.length === 0 || decoded.length > UPLOAD_MAX_CHUNK_BYTES) {
+    _failUpload(sender, session, msg.id, "invalid_message", "upload_chunk: chunk too large");
+    return;
+  }
+  if (session.bytes + decoded.length > session.size) {
+    _failUpload(sender, session, msg.id, "upload_size_mismatch", "More data than the declared size — aborting");
+    return;
+  }
+  try {
+    writeFileSync(session.partPath, decoded, { flag: "a" });
+  } catch (error) {
+    _failUpload(sender, session, msg.id, "internal_error", `Could not write the upload: ${error instanceof Error ? error.message : String(error)}`);
+    return;
+  }
+  session.bytes += decoded.length;
+  session.nextIndex += 1;
+  session.lastSeenAt = Date.now();
+}
+
+/** Final hash-based idempotency: reuse an existing file of identical content. */
+async function _uniqueUploadPathByHash(dir: string, name: string, sha256: string): Promise<string> {
+  const first = join(dir, name);
+  if (existsSync(first)) {
+    try {
+      if (await _sha256OfFile(first) === sha256) return first;
+    } catch { /* unreadable → fall through to a fresh name */ }
+  }
+  return _freshUploadPath(dir, name);
+}
+
+/** Streamed hash — never buffers the whole (up to 250 MiB) file in memory. */
+function _sha256OfFile(path: string): Promise<string> {
+  return new Promise((resolveHash, reject) => {
+    const hash = createHash("sha256");
+    const stream = createReadStream(path);
+    stream
+      .on("data", (chunk) => hash.update(chunk))
+      .on("end", () => resolveHash(hash.digest("hex")))
+      .on("error", (error) => reject(error));
+  });
+}
+
+export async function _handleUploadDone(sender: PlainPeerChannel, msg: { id: string; sha256: string }): Promise<void> {
+  const session = _uploadIdValid(msg.id) ? _uploadSessions.get(msg.id) : undefined;
+  if (!session) {
+    _failUpload(sender, undefined, _replyId(msg.id), "invalid_message", "upload_done: unknown session");
+    return;
+  }
+  if (session.sender !== sender) {
+    _failUpload(sender, undefined, _replyId(msg.id), "upload_rejected", "upload_done: not your session");
+    return;
+  }
+  if (session.bytes !== session.size) {
+    _failUpload(sender, session, msg.id, "upload_size_mismatch", `Received ${session.bytes} of ${session.size} bytes`);
+    return;
+  }
+  if (typeof msg.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(msg.sha256)) {
+    _failUpload(sender, session, msg.id, "invalid_message", "upload_done: malformed sha256");
+    return;
+  }
+  let actual: string;
+  try {
+    actual = await _sha256OfFile(session.partPath);
+  } catch (error) {
+    _failUpload(sender, session, msg.id, "internal_error", `Could not verify the upload: ${error instanceof Error ? error.message : String(error)}`);
+    return;
+  }
+  if (actual !== msg.sha256) {
+    _failUpload(sender, session, msg.id, "upload_hash_mismatch", "Content hash does not match — file corrupted in transit");
+    return;
+  }
+  _uploadSessions.delete(msg.id);
+  const dir = dirname(session.partPath);
+  let finalPath: string;
+  try {
+    finalPath = await _uniqueUploadPathByHash(dir, session.name, actual);
+    renameSync(session.partPath, finalPath);
+    try { chmodSync(finalPath, 0o600); } catch { /* best effort */ }
+  } catch (error) {
+    console.error(`[remote-pi] upload ${msg.id} failed at rename: ${error instanceof Error ? error.message : String(error)}`);
+    try { unlinkSync(session.partPath); } catch { /* best effort */ }
+    sender.send({
+      type: "error",
+      code: "internal_error",
+      in_reply_to: _replyId(msg.id),
+      message: `Could not save the uploaded file: ${error instanceof Error ? error.message : String(error)}`,
+    });
+    return;
+  }
+  console.error(`[remote-pi] upload ${msg.id} landed at ${finalPath}`);
+  sender.send({ type: "upload_complete", in_reply_to: msg.id, id: msg.id, name: session.name, path: finalPath });
+}
+
+/** Reap stalled sessions: idle for >[UPLOAD_IDLE_MS], or started >[UPLOAD_TTL_MS] ago. */
+export function _sweepUploads(): void {
+  const now = Date.now();
+  for (const session of [..._uploadSessions.values()]) {
+    if (now - session.lastSeenAt < UPLOAD_IDLE_MS && now - session.startedAt < UPLOAD_TTL_MS) continue;
+    _uploadSessions.delete(session.id);
+    try { if (existsSync(session.partPath)) unlinkSync(session.partPath); } catch { /* already gone */ }
+  }
+}
+
+/** Test-only: drop in-flight sessions without touching the part files. */
+export function _resetUploadSessionsForTest(): void {
+  _uploadSessions.clear();
+}
+
+let _uploadSweepTimer: ReturnType<typeof setInterval> | undefined;
+
+/** Periodic TTL sweep; started once (unref'd — never holds the process open). */
+export function _startUploadSweep(): void {
+  if (_uploadSweepTimer) return;
+  _uploadSweepTimer = setInterval(() => _sweepUploads(), 10 * 60 * 1000);
+  _uploadSweepTimer.unref();
 }
 
 /**
@@ -5575,6 +5871,22 @@ export function _routeClientMessageFrom(
   // card after a re-sync must work in a room whose Pi session is gone.
   if (msg.type === "file_get") {
     void handleFileGetRequest(msg, (reply) => sender.send(reply));
+    return;
+  }
+  // Plan/62 — chunked binary upload. No live Pi session needed (the bytes
+  // land on disk before any message wakes the agent).
+  if (msg.type === "upload_start") {
+    _handleUploadStart(sender, msg);
+    return;
+  }
+  if (msg.type === "upload_chunk") {
+    _handleUploadChunk(sender, msg);
+    return;
+  }
+  if (msg.type === "upload_done") {
+    void _handleUploadDone(sender, msg).catch((error) => {
+      console.error(`[remote-pi] upload_done handler failed id=${msg.id}: ${error instanceof Error ? error.message : String(error)}`);
+    });
     return;
   }
   if (!_pi) return;

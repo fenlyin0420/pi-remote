@@ -6,10 +6,10 @@
  */
 import { describe, expect, test, vi, beforeEach, afterEach } from "vitest";
 import { EventEmitter } from "node:events";
-import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getCapabilities, setCapabilities } from "@earendil-works/pi-tui";
 import { _resetModelRegistryForTests } from "./actions/registry.js";
@@ -258,6 +258,7 @@ const {
   _routeClientMessageFrom,
   _deliverMeshMessageToAgentForTest,
   _setUploadDirForTest,
+  _resetUploadSessionsForTest,
   _resetPendingToolImagesForTest,
   _setLastKnownSessionFileForTest,
   CTRL_PREFIX,
@@ -2102,6 +2103,260 @@ describe("multi-channel broadcast (W2D)", () => {
       text: "what changed?",
       files: [{ name: "report.csv", path }],
     });
+  });
+
+  // ── Plan/62 — chunked binary upload (app → Pi) ──────────────────────────
+
+  function _emitClientFrame(frame: Record<string, unknown>): void {
+    relayRef.current!.emit("message", JSON.stringify({
+      peer: "ownerA__1234567890",
+      ct: Buffer.from(JSON.stringify(frame)).toString("base64"),
+    }));
+  }
+
+  async function _runUpload(frames: Array<Record<string, unknown>>): Promise<Array<{ inner: Record<string, unknown> }>> {
+    for (const frame of frames) _emitClientFrame(frame);
+    // upload_done settles asynchronously (streamed hash check → rename), so
+    // pump until the send log is quiescent — otherwise a test's finally-rm
+    // races the rename and deletes the part file out from under it.
+    let stable = 0;
+    let last = -1;
+    for (let i = 0; i < 2000 && stable < 20; i += 1) {
+      await new Promise<void>((r) => setTimeout(r, 5));
+      const n = relayRef.current!.send.mock.calls.length;
+      if (n === last) stable += 1;
+      else { stable = 0; last = n; }
+    }
+    return relayRef.current!.send.mock.calls
+      .map((c) => c[0] as string)
+      .map(decodeSentCt);
+  }
+
+  test("chunked upload: start→chunks→done verifies the sha256, lands the bytes, and answers with the path", async () => {
+    await _pairForTest("ownerA__1234567890");
+    const dir = mkdtempSync(join(tmpdir(), "pi-chunk-upload-"));
+    _setUploadDirForTest(dir);
+    try {
+      const bytes = randomBytes(40000);
+      const sha = createHash("sha256").update(bytes).digest("hex");
+      const sent = await _runUpload([
+        { type: "upload_start", id: "up-abc12345", name: "doc.pdf", size: bytes.length },
+        { type: "upload_chunk", id: "up-abc12345", index: 0, data: bytes.subarray(0, 20000).toString("base64") },
+        { type: "upload_chunk", id: "up-abc12345", index: 1, data: bytes.subarray(20000).toString("base64") },
+        { type: "upload_done", id: "up-abc12345", sha256: sha },
+      ]);
+      const done = sent.find((d) => d.inner.type === "upload_complete");
+      expect(done).toBeDefined();
+      const path = (done!.inner as { path?: string }).path ?? "";
+      expect(done!.inner).toMatchObject({ type: "upload_complete", id: "up-abc12345", name: "doc.pdf" });
+      expect(path.startsWith(dir)).toBe(true);
+      expect(readFileSync(path).equals(bytes)).toBe(true);
+      const roomDir = join(dir, readdirSync(dir)[0]!);
+      expect(readdirSync(roomDir).some((f) => f.endsWith(".part"))).toBe(false);
+
+      // The user_message reference rides the existing notice/echo pipeline —
+      // no bytes cross the wire.
+      const sentToAgent: unknown[] = [];
+      _setPiForTest({ sendUserMessage: (c: unknown) => { sentToAgent.push(c); }, sendMessage: () => undefined });
+      const sendsBefore = relayRef.current!.send.mock.calls.length;
+      _emitClientFrame({ type: "user_message", id: "msg-ref", text: "review this", files: [{ name: "doc.pdf", path }] });
+      await new Promise<void>((r) => setImmediate(r));
+      expect(sentToAgent).toHaveLength(1);
+      const notice = (sentToAgent[0] as Array<{ text?: string }>).map((b) => b.text).join("");
+      expect(notice).toContain(`[Uploaded file: doc.pdf → ${path}]`);
+      const echo = relayRef.current!.send.mock.calls.slice(sendsBefore)
+        .map((c) => c[0] as string).map(decodeSentCt)
+        .find((d) => d.inner.type === "user_message");
+      expect(echo?.inner).toMatchObject({ type: "user_message", id: "msg-ref", text: "review this", files: [{ name: "doc.pdf", path }] });
+      expect(JSON.stringify(echo?.inner)).not.toContain("review this\n");
+    } finally {
+      _resetUploadSessionsForTest();
+      _setUploadDirForTest(undefined);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("chunked upload: a wrong sha256 is rejected and the part file is removed", async () => {
+    await _pairForTest("ownerA__1234567890");
+    const dir = mkdtempSync(join(tmpdir(), "pi-chunk-upload-"));
+    _setUploadDirForTest(dir);
+    try {
+      const bytes = randomBytes(1000);
+      const sent = await _runUpload([
+        { type: "upload_start", id: "up-bad12345", name: "a.bin", size: bytes.length },
+        { type: "upload_chunk", id: "up-bad12345", index: 0, data: bytes.toString("base64") },
+        { type: "upload_done", id: "up-bad12345", sha256: "0".repeat(64) },
+      ]);
+      expect(sent.find((d) => d.inner.type === "upload_complete")).toBeUndefined();
+      const err = sent.find((d) => d.inner.type === "error" && d.inner.code === "upload_hash_mismatch");
+      expect(err).toBeDefined();
+      expect(existsSync(join(dir, readdirSync(dir)[0]!, "up-bad12345.part"))).toBe(false);
+    } finally {
+      _resetUploadSessionsForTest();
+      _setUploadDirForTest(undefined);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("chunked upload: an out-of-order chunk cancels the session", async () => {
+    await _pairForTest("ownerA__1234567890");
+    const dir = mkdtempSync(join(tmpdir(), "pi-chunk-upload-"));
+    _setUploadDirForTest(dir);
+    try {
+      const bytes = randomBytes(2000);
+      const sent = await _runUpload([
+        { type: "upload_start", id: "up-ooo12345", name: "a.bin", size: bytes.length },
+        { type: "upload_chunk", id: "up-ooo12345", index: 1, data: bytes.subarray(1000).toString("base64") },
+        { type: "upload_chunk", id: "up-ooo12345", index: 0, data: bytes.subarray(0, 1000).toString("base64") },
+        { type: "upload_done", id: "up-ooo12345", sha256: createHash("sha256").update(bytes).digest("hex") },
+      ]);
+      expect(sent.find((d) => d.inner.code === "upload_rejected")).toBeDefined();
+      expect(sent.find((d) => d.inner.code === "invalid_message")).toBeDefined(); // done after cancel → unknown session
+      expect(sent.find((d) => d.inner.type === "upload_complete")).toBeUndefined();
+    } finally {
+      _resetUploadSessionsForTest();
+      _setUploadDirForTest(undefined);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("chunked upload: files above the ceiling are rejected at upload_start", async () => {
+    await _pairForTest("ownerA__1234567890");
+    const dir = mkdtempSync(join(tmpdir(), "pi-chunk-upload-"));
+    _setUploadDirForTest(dir);
+    try {
+      const sent = await _runUpload([
+        { type: "upload_start", id: "up-big12345", name: "big.bin", size: 250 * 1024 * 1024 + 1 },
+      ]);
+      const err = sent.find((d) => d.inner.type === "error" && d.inner.code === "upload_too_large");
+      expect(err).toBeDefined();
+      expect(readdirSync(dir)).toHaveLength(0); // no room dir created for a rejected start
+    } finally {
+      _resetUploadSessionsForTest();
+      _setUploadDirForTest(undefined);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("user_message: a file reference whose path escapes the uploads dir is dropped", async () => {
+    await _pairForTest("ownerA__1234567890");
+    const dir = mkdtempSync(join(tmpdir(), "pi-chunk-upload-"));
+    _setUploadDirForTest(dir);
+    try {
+      const sentToAgent: unknown[] = [];
+      _setPiForTest({ sendUserMessage: (c: unknown) => { sentToAgent.push(c); }, sendMessage: () => undefined });
+      _emitClientFrame({ type: "user_message", id: "msg-evil", text: "hi", files: [{ name: "evil.pdf", path: "/etc/passwd" }] });
+      await new Promise<void>((r) => setImmediate(r));
+      const sent0 = sentToAgent[0];
+      const text = typeof sent0 === "string"
+        ? sent0
+        : (sent0 as Array<{ text?: string }>).map((b) => b.text ?? "").join("");
+      expect(text).not.toContain("Uploaded file");
+    } finally {
+      _resetUploadSessionsForTest();
+      _setUploadDirForTest(undefined);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("chunked upload: the fourth concurrent start is rejected with upload_rejected", async () => {
+    await _pairForTest("ownerA__1234567890");
+    const dir = mkdtempSync(join(tmpdir(), "pi-chunk-upload-"));
+    _setUploadDirForTest(dir);
+    try {
+      const frames: Array<Record<string, unknown>> = [];
+      for (const id of ["up-cap1aaaa", "up-cap2bbbb", "up-cap3cccc"]) {
+        frames.push(
+          { type: "upload_start", id, name: "a.bin", size: 1000 },
+          { type: "upload_chunk", id, index: 0, data: randomBytes(1000).toString("base64") },
+        );
+      }
+      frames.push({ type: "upload_start", id: "up-cap4dddd", name: "d.bin", size: 1000 });
+      const sent = await _runUpload(frames);
+      const err = sent.find((d) => d.inner.type === "error" && d.inner.code === "upload_rejected");
+      expect(err?.inner.in_reply_to).toBe("up-cap4dddd");
+      expect(sent.find((d) => d.inner.type === "upload_complete")).toBeUndefined();
+    } finally {
+      _resetUploadSessionsForTest();
+      _setUploadDirForTest(undefined);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("chunked upload: a chunk for an unknown session answers an error frame", async () => {
+    await _pairForTest("ownerA__1234567890");
+    const dir = mkdtempSync(join(tmpdir(), "pi-chunk-upload-"));
+    _setUploadDirForTest(dir);
+    try {
+      const sent = await _runUpload([
+        { type: "upload_chunk", id: "up-unknown1", index: 0, data: Buffer.from("hi").toString("base64") },
+      ]);
+      const err = sent.find((d) => d.inner.type === "error" && d.inner.code === "invalid_message");
+      expect(err?.inner.in_reply_to).toBe("up-unknown1");
+    } finally {
+      _resetUploadSessionsForTest();
+      _setUploadDirForTest(undefined);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("user_message: a reference that walks back out of the uploads dir with .. is dropped", async () => {
+    await _pairForTest("ownerA__1234567890");
+    const dir = mkdtempSync(join(tmpdir(), "pi-chunk-upload-"));
+    _setUploadDirForTest(dir);
+    try {
+      // Land a real file in the room dir, then reference a file OUTSIDE it via `..`.
+      const bytes = randomBytes(1000);
+      await _runUpload([
+        { type: "upload_start", id: "up-esc1234", name: "a.bin", size: bytes.length },
+        { type: "upload_chunk", id: "up-esc1234", index: 0, data: bytes.toString("base64") },
+        { type: "upload_done", id: "up-esc1234", sha256: createHash("sha256").update(bytes).digest("hex") },
+      ]);
+      const roomDir = join(dir, readdirSync(dir)[0]!);
+      writeFileSync(join(dir, "outside.txt"), "secret");
+      const sneaky = join(roomDir, "a.bin", "..", "..", "outside.txt");
+      expect(resolve(sneaky).startsWith(roomDir)).toBe(false);
+
+      const sentToAgent: unknown[] = [];
+      _setPiForTest({ sendUserMessage: (c: unknown) => { sentToAgent.push(c); }, sendMessage: () => undefined });
+      _emitClientFrame({ type: "user_message", id: "msg-evil2", text: "hi", files: [{ name: "o.txt", path: sneaky }] });
+      await new Promise<void>((r) => setImmediate(r));
+      const sent0 = sentToAgent[0];
+      const text = typeof sent0 === "string"
+        ? sent0
+        : (sent0 as Array<{ text?: string }>).map((b) => b.text ?? "").join("");
+      expect(text).not.toContain("Uploaded file");
+    } finally {
+      _resetUploadSessionsForTest();
+      _setUploadDirForTest(undefined);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("chunked upload: an orphan part from a dead session is pruned at the next start", async () => {
+    await _pairForTest("ownerA__1234567890");
+    const dir = mkdtempSync(join(tmpdir(), "pi-chunk-upload-"));
+    _setUploadDirForTest(dir);
+    try {
+      const bytes = randomBytes(1000);
+      await _runUpload([
+        { type: "upload_start", id: "up-live0001", name: "a.bin", size: bytes.length },
+        { type: "upload_chunk", id: "up-live0001", index: 0, data: bytes.toString("base64") },
+        { type: "upload_done", id: "up-live0001", sha256: createHash("sha256").update(bytes).digest("hex") },
+      ]);
+      const roomDir = join(dir, readdirSync(dir)[0]!);
+      const orphan = join(roomDir, "up-ghost999.part");
+      writeFileSync(orphan, new Uint8Array(8));
+      const twoHoursAgo = (Date.now() - 2 * 60 * 60 * 1000) / 1000;
+      utimesSync(orphan, twoHoursAgo, twoHoursAgo);
+      // A fresh start triggers the prune of past-TTL orphans.
+      await _runUpload([{ type: "upload_start", id: "up-live0002", name: "b.bin", size: 100 }]);
+      expect(existsSync(orphan)).toBe(false);
+    } finally {
+      _resetUploadSessionsForTest();
+      _setUploadDirForTest(undefined);
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test(
