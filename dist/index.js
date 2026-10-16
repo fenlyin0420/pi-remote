@@ -1112,6 +1112,32 @@ function _uploadDir() {
 function _replyId(id) {
     return typeof id === "string" ? id : undefined;
 }
+/** Reverse-look up the owner peer id of a currently-attached channel. */
+function _peerIdOfChannel(channel) {
+    for (const [peerId, ch] of _activePeers) {
+        if (ch === channel)
+            return peerId;
+    }
+    return undefined;
+}
+/**
+ * Whether `sender` may drive `session`. A reconnect re-attaches the app under
+ * the same peer id but a fresh `PlainPeerChannel`; the session adopts it and
+ * the byte/index stream continues where it left off. A genuinely different
+ * peer stays refused.
+ */
+function _sessionAcceptsUploadSender(session, sender) {
+    if (session.sender === sender)
+        return true;
+    const senderPeerId = _peerIdOfChannel(sender);
+    if (senderPeerId !== undefined && senderPeerId === session.ownerPeerId) {
+        session.sender = sender;
+        console.error(`[remote-pi] upload ${session.id} adopted the reconnected channel for the same owner`);
+        return true;
+    }
+    console.error(`[remote-pi] upload ${session.id} refused: a different peer tried to continue it (owner=${session.ownerPeerId ?? "?"}, sender=${senderPeerId ?? "?"})`);
+    return false;
+}
 /** Drop a session (and its part file) and tell the sender why. */
 function _failUpload(sender, session, inReplyTo, code, message) {
     if (session) {
@@ -1121,6 +1147,12 @@ function _failUpload(sender, session, inReplyTo, code, message) {
         }
         catch { /* already gone */ }
         console.error(`[remote-pi] upload ${session.id} cancelled: ${code}`);
+    }
+    else {
+        // No session to name (a malformed/too-large/rejected start, or a frame
+        // for a session that no longer exists): still log it — a silent
+        // rejection is undiagnosable from the outside.
+        console.error(`[remote-pi] upload refused (${code}) for ${inReplyTo ?? "<no id>"}: ${message}`);
     }
     sender.send({ type: "error", code, in_reply_to: inReplyTo, message });
 }
@@ -1179,6 +1211,7 @@ export function _handleUploadStart(sender, msg) {
         startedAt,
         lastSeenAt: startedAt,
         sender,
+        ownerPeerId: _peerIdOfChannel(sender),
     });
     console.error(`[remote-pi] upload ${msg.id} started: ${msg.name} (${msg.size} bytes)`);
 }
@@ -1195,7 +1228,7 @@ export function _handleUploadChunk(sender, msg) {
         sender.send({ type: "error", code: "upload_session_lost", in_reply_to: _replyId(msg.id), message: "upload_chunk: unknown session" });
         return;
     }
-    if (session.sender !== sender) {
+    if (!_sessionAcceptsUploadSender(session, sender)) {
         // Another peer must not append to (or steer) someone else's session.
         sender.send({ type: "error", code: "upload_rejected", in_reply_to: _replyId(msg.id), message: "upload_chunk: not your session" });
         return;
@@ -1227,6 +1260,7 @@ export function _handleUploadChunk(sender, msg) {
     session.bytes += decoded.length;
     session.nextIndex += 1;
     session.lastSeenAt = Date.now();
+    console.error(`[remote-pi] upload ${session.id} chunk ${msg.index} ok (${session.bytes}/${session.size} bytes)`);
 }
 /** Final hash-based idempotency: reuse an existing file of identical content. */
 async function _uniqueUploadPathByHash(dir, name, sha256) {
@@ -1257,10 +1291,11 @@ export async function _handleUploadDone(sender, msg) {
         _failUpload(sender, undefined, _replyId(msg.id), "upload_session_lost", "upload_done: unknown session");
         return;
     }
-    if (session.sender !== sender) {
+    if (!_sessionAcceptsUploadSender(session, sender)) {
         _failUpload(sender, undefined, _replyId(msg.id), "upload_rejected", "upload_done: not your session");
         return;
     }
+    console.error(`[remote-pi] upload ${session.id} done received (${session.bytes}/${session.size} bytes)`);
     if (session.bytes !== session.size) {
         _failUpload(sender, session, msg.id, "upload_size_mismatch", `Received ${session.bytes} of ${session.size} bytes`);
         return;

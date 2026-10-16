@@ -1266,6 +1266,12 @@ interface UploadSession {
   lastSeenAt: number;
   /** The peer channel that opened the session; other senders' frames are refused. */
   sender: PlainPeerChannel;
+  /**
+   * Relay peer id of the opening device. A reconnect re-attaches the app with
+   * a FRESH channel object, so object identity alone would refuse the app's
+   * own chunks after a transport flap — the id is what survives it.
+   */
+  ownerPeerId?: string;
 }
 
 const _uploadSessions = new Map<string, UploadSession>();
@@ -1286,6 +1292,32 @@ function _replyId(id: unknown): string | undefined {
   return typeof id === "string" ? id : undefined;
 }
 
+/** Reverse-look up the owner peer id of a currently-attached channel. */
+function _peerIdOfChannel(channel: PlainPeerChannel): string | undefined {
+  for (const [peerId, ch] of _activePeers) {
+    if (ch === channel) return peerId;
+  }
+  return undefined;
+}
+
+/**
+ * Whether `sender` may drive `session`. A reconnect re-attaches the app under
+ * the same peer id but a fresh `PlainPeerChannel`; the session adopts it and
+ * the byte/index stream continues where it left off. A genuinely different
+ * peer stays refused.
+ */
+function _sessionAcceptsUploadSender(session: UploadSession, sender: PlainPeerChannel): boolean {
+  if (session.sender === sender) return true;
+  const senderPeerId = _peerIdOfChannel(sender);
+  if (senderPeerId !== undefined && senderPeerId === session.ownerPeerId) {
+    session.sender = sender;
+    console.error(`[remote-pi] upload ${session.id} adopted the reconnected channel for the same owner`);
+    return true;
+  }
+  console.error(`[remote-pi] upload ${session.id} refused: a different peer tried to continue it (owner=${session.ownerPeerId ?? "?"}, sender=${senderPeerId ?? "?"})`);
+  return false;
+}
+
 /** Drop a session (and its part file) and tell the sender why. */
 function _failUpload(
   sender: PlainPeerChannel,
@@ -1298,6 +1330,11 @@ function _failUpload(
     _uploadSessions.delete(session.id);
     try { unlinkSync(session.partPath); } catch { /* already gone */ }
     console.error(`[remote-pi] upload ${session.id} cancelled: ${code}`);
+  } else {
+    // No session to name (a malformed/too-large/rejected start, or a frame
+    // for a session that no longer exists): still log it — a silent
+    // rejection is undiagnosable from the outside.
+    console.error(`[remote-pi] upload refused (${code}) for ${inReplyTo ?? "<no id>"}: ${message}`);
   }
   sender.send({ type: "error", code, in_reply_to: inReplyTo, message });
 }
@@ -1352,6 +1389,7 @@ export function _handleUploadStart(sender: PlainPeerChannel, msg: { id: string; 
     startedAt,
     lastSeenAt: startedAt,
     sender,
+    ownerPeerId: _peerIdOfChannel(sender),
   });
   console.error(`[remote-pi] upload ${msg.id} started: ${msg.name} (${msg.size} bytes)`);
 }
@@ -1369,7 +1407,7 @@ export function _handleUploadChunk(sender: PlainPeerChannel, msg: { id: string; 
     sender.send({ type: "error", code: "upload_session_lost", in_reply_to: _replyId(msg.id), message: "upload_chunk: unknown session" });
     return;
   }
-  if (session.sender !== sender) {
+  if (!_sessionAcceptsUploadSender(session, sender)) {
     // Another peer must not append to (or steer) someone else's session.
     sender.send({ type: "error", code: "upload_rejected", in_reply_to: _replyId(msg.id), message: "upload_chunk: not your session" });
     return;
@@ -1400,6 +1438,7 @@ export function _handleUploadChunk(sender: PlainPeerChannel, msg: { id: string; 
   session.bytes += decoded.length;
   session.nextIndex += 1;
   session.lastSeenAt = Date.now();
+  console.error(`[remote-pi] upload ${session.id} chunk ${msg.index} ok (${session.bytes}/${session.size} bytes)`);
 }
 
 /** Final hash-based idempotency: reuse an existing file of identical content. */
@@ -1431,15 +1470,15 @@ export async function _handleUploadDone(sender: PlainPeerChannel, msg: { id: str
     _failUpload(sender, undefined, _replyId(msg.id), "upload_session_lost", "upload_done: unknown session");
     return;
   }
-  if (session.sender !== sender) {
+  if (!_sessionAcceptsUploadSender(session, sender)) {
     _failUpload(sender, undefined, _replyId(msg.id), "upload_rejected", "upload_done: not your session");
     return;
   }
+  console.error(`[remote-pi] upload ${session.id} done received (${session.bytes}/${session.size} bytes)`);
   if (session.bytes !== session.size) {
     _failUpload(sender, session, msg.id, "upload_size_mismatch", `Received ${session.bytes} of ${session.size} bytes`);
     return;
-  }
-  if (typeof msg.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(msg.sha256)) {
+  }  if (typeof msg.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(msg.sha256)) {
     _failUpload(sender, session, msg.id, "invalid_message", "upload_done: malformed sha256");
     return;
   }
