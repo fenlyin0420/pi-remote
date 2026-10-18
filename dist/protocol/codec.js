@@ -16,6 +16,8 @@ const SERVER_TYPES = new Set([
     "session_history",
     // Plan/57 — interactive extension prompt (ask_user via pi-ask).
     "extension_ui_request",
+    // Plan/63 — the agent's todo list (pi-todo), live and replayed on sync.
+    "todo_state",
 ]);
 export class DecodeError extends Error {
     code;

@@ -49,6 +49,7 @@ import { RelayClient, RoomAlreadyOpenError } from "./transport/relay_client.js";
 import { PlainPeerChannel } from "./transport/peer_channel.js";
 import { createExtensionUiBridge, } from "./extension_ui_bridge.js";
 import { createUiNotifyCapture as _createUiNotifyCapture } from "./ui_notify_capture.js";
+import { createTodoBridge } from "./todo_bridge.js";
 import { roomIdFor } from "./rooms.js";
 import { registerAgentTools } from "./session/tools.js";
 import { ATTACHMENT_CUSTOM_TYPE, SEND_TO_PHONE_TOOL, _encodeInlineImage, _imageBlocksFromToolResult, handleFileGetRequest, registerSendToPhoneTool, } from "./session/attachment.js";
@@ -1822,6 +1823,9 @@ let _pi = null;
 // Plan/57 — Bridge to pi-ask's clarification-flow events. null until the
 // extension factory wires it (and null if the SDK exposes no events bus).
 let _extensionUiBridge = null;
+// Plan/63 — My mirrors of pi-todo's task list. Holds no subscriptions; the
+// session hooks below call `refresh` with the live ctx.
+let _todoBridge = null;
 /**
  * Captures `ctx.ui.notify()` calls made by OTHER extensions in this process and
  * relays them to the paired app. See `ui_notify_capture.ts` for why this is done
@@ -2898,6 +2902,9 @@ const extension = (pi) => {
     // factory re-run (new pi session) can't leak subscriptions or double-send.
     _extensionUiBridge?.dispose();
     _extensionUiBridge = createExtensionUiBridge(pi, _broadcastToActive);
+    // Plan/63 — pi-todo's list, mirrored to the app. Inert when pi-todo isn't
+    // installed: the branch simply carries no snapshot to publish.
+    _todoBridge = createTodoBridge(_broadcastToActive);
     // Command output reaches the phone through here: extensions answer a slash
     // command with `ctx.ui.notify(...)` rather than by printing, and that output
     // used to die inside the daemon. Wrap the session's shared UI context so those
@@ -3073,6 +3080,11 @@ const extension = (pi) => {
         // early-return — a room with no active app peer still updates its
         // room_meta context.
         _publishContextUsage(ctx);
+        // Plan/63 — pi-todo writes its snapshot to the branch inside the tool call,
+        // so by the time the tool ends the list is already there. Refreshing here
+        // (before the peer early-return) keeps the remembered list current even in a
+        // room nobody is watching, so a later `session_sync` replays the right one.
+        _todoBridge?.refresh(ctx);
         // Queue any image the tool returned before the peer check: the replay has
         // to rebuild the card even when nobody was watching live.
         _queueInlineToolImages(event);
@@ -3352,6 +3364,14 @@ const extension = (pi) => {
                     console.error(`[remote-pi] notify → app: ${text.slice(0, 120)}`);
             });
         }
+        // Plan/63 — same re-arm rule for the todo mirror, plus a rescan: the branch
+        // is the new session's, so forget the old cursor and republish (an empty list
+        // after `/new` is what tells the app to drop the previous session's rows).
+        if (!_todoBridge)
+            _todoBridge = createTodoBridge(_broadcastToActive);
+        if (sessionReplaced)
+            _todoBridge.reset();
+        _todoBridge.refresh(ctx);
         // Rearm a reused-but-disposed instance. The session_shutdown teardown (below)
         // sets _disposed=true assuming the host re-evaluates THIS module fresh for the
         // replacement session, yielding a new instance with _disposed=false. Some hosts
@@ -3452,6 +3472,9 @@ const extension = (pi) => {
         _extensionUiBridge = null;
         _uiNotifyCapture?.dispose();
         _uiNotifyCapture = null;
+        // The todo mirror holds no subscriptions — only the branch cursor, which the
+        // next session_start rebuilds from its own branch.
+        _todoBridge = null;
         // Drop captured ctxs immediately. On module-reuse hosts the same instance
         // survives session replacement; leaving `_lastCtx` pointing at the now-
         // stale command ctx is what crashed pi in _refreshFooter on peer reconnect
@@ -6341,6 +6364,12 @@ function _handleSessionSync(sender, msg) {
     for (const req of _extensionUiBridge?.pendingRequests() ?? []) {
         sender.send(req);
     }
+    // Plan/63 — the todo list is not part of the history mirror (it lives in a
+    // custom branch entry, which `session_history` does not carry), so a device
+    // that connects later — or reconnects after a restart — would never learn it.
+    // Replayed per-sender, after the history.
+    if (_todoBridge)
+        sender.send(_todoBridge.current());
 }
 /**
  * Resets the Pi-side session view after a SUCCESSFUL `session_new`. The app's
@@ -6363,6 +6392,11 @@ function _resetSessionForNew(inReplyTo) {
     _lastConsumedSteerText = null;
     _resetQueuedItems({ broadcast: true });
     _sessionStartedAt = Date.now();
+    // Plan/63 — a brand-new session starts with no todo list. `session_start`
+    // rescans after this, but the app must also be told to drop the rows it is
+    // showing right now, and that reset path has no ctx to rescan with.
+    _todoBridge?.reset();
+    _todoBridge?.publish();
     _broadcastToActive({
         type: "session_history",
         in_reply_to: inReplyTo,

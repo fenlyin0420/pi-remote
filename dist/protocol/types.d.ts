@@ -420,6 +420,9 @@ export type ServerMessage = {
     text?: string;
     items?: QueuedMessageItem[];
 } | {
+    type: "todo_state";
+    tasks: TodoTaskWire[];
+} | {
     type: "steer_consumed";
     id: string;
 } | {
@@ -609,3 +612,25 @@ export interface WireModel {
     vision: boolean;
 }
 export type ByeReason = "peer_stop" | "session_replaced" | "shutdown";
+/**
+ * Plan/63 — one row of the agent's todo list (`todo_state`).
+ *
+ * Mirrors the `Task` record pi-todo persists, trimmed to what a phone row
+ * renders: tombstones (`deleted`) are filtered out by the plugin, and
+ * `description` / `metadata` stay off the wire — both are agent bookkeeping
+ * that the list itself never shows.
+ */
+export interface TodoTaskWire {
+    id: number;
+    subject: string;
+    /** One of [TodoTaskStatusWire], or whatever a newer pi-todo added — the app
+     *  renders an unknown state as a neutral row instead of dropping it. */
+    status: TodoTaskStatusWire | (string & {});
+    /** Present-continuous label for the in-progress row ("writing tests"). */
+    active_form?: string;
+    /** Ids this row waits on (`blockedBy` in pi-todo). */
+    blocked_by?: number[];
+    owner?: string;
+}
+/** pi-todo's task states minus `deleted`, which never reaches the app. */
+export type TodoTaskStatusWire = "pending" | "in_progress" | "completed";

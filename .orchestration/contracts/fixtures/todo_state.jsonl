@@ -1,0 +1,2 @@
+{"type":"todo_state","tasks":[{"id":1,"subject":"Adapt the app","status":"in_progress","active_form":"implementing the ball"},{"id":2,"subject":"Run the tests","status":"pending","blocked_by":[1]}]}
+{"type":"todo_state","tasks":[]}

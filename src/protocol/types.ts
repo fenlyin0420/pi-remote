@@ -447,6 +447,13 @@ export type ServerMessage =
       streaming_behavior?: StreamingBehavior;
     }
   | { type: "queued_message_state"; id?: string; text?: string; items?: QueuedMessageItem[] }
+  // Plan/63 — the agent's todo list (pi-todo / `rpiv-todo`), replayed on
+  // `session_sync` too. The plugin is the source: it mirrors the snapshot
+  // rpiv-todo writes to the session branch on every change, so a `todo` call
+  // made from a codemode script is covered as well. `tasks: []` means "no
+  // list" — a fresh session, a cleared list, or pi-todo not installed — and
+  // the app hides the affordance it shows for a non-empty one.
+  | { type: "todo_state"; tasks: TodoTaskWire[] }
   | { type: "steer_consumed"; id: string }
   | { type: "agent_chunk"; in_reply_to: string; delta: string }
   // Model reasoning tokens, streamed live on the same turn as `agent_chunk`.
@@ -638,3 +645,27 @@ export interface WireModel {
 }
 
 export type ByeReason = "peer_stop" | "session_replaced" | "shutdown";
+
+/**
+ * Plan/63 — one row of the agent's todo list (`todo_state`).
+ *
+ * Mirrors the `Task` record pi-todo persists, trimmed to what a phone row
+ * renders: tombstones (`deleted`) are filtered out by the plugin, and
+ * `description` / `metadata` stay off the wire — both are agent bookkeeping
+ * that the list itself never shows.
+ */
+export interface TodoTaskWire {
+  id: number;
+  subject: string;
+  /** One of [TodoTaskStatusWire], or whatever a newer pi-todo added — the app
+   *  renders an unknown state as a neutral row instead of dropping it. */
+  status: TodoTaskStatusWire | (string & {});
+  /** Present-continuous label for the in-progress row ("writing tests"). */
+  active_form?: string;
+  /** Ids this row waits on (`blockedBy` in pi-todo). */
+  blocked_by?: number[];
+  owner?: string;
+}
+
+/** pi-todo's task states minus `deleted`, which never reaches the app. */
+export type TodoTaskStatusWire = "pending" | "in_progress" | "completed";

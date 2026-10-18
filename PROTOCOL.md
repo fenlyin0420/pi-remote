@@ -681,6 +681,74 @@ relay; restart perde o estado.
 
 ---
 
+## Lista de tarefas do agente (pi-todo)
+
+A extensão `@juicesharp/rpiv-todo` (aqui, o fork `fenlyin0420/pi-todo`)
+registra a tool `todo` e mantém um painel de tarefas acima do editor do Pi. O
+app mostra a mesma lista como um balão flutuante na sala: `done/total` no
+balão, a lista completa ao tocar.
+
+### Fonte da verdade
+
+Nada é recalculado a partir das chamadas da tool. O `rpiv-todo` grava o
+snapshot **completo** pós-mutação em uma entrada `custom` do branch da sessão
+(`customType: "rpiv-todo-state"`, `data` = o mesmo envelope `details` da tool)
+a cada mudança — é assim que o painel dele sobrevive a `/reload`, `/resume` e
+compactação. O remote-pi lê a **última** dessas entradas no branch:
+
+- cobre `todo` chamado de dentro de um script de codemode, cuja chamada nunca
+  aparece como `toolResult` próprio;
+- é o que um re-sync depois de um restart do daemon reproduz;
+- cai na mesma fonte secundária que o pacote usa quando o branch não tem
+  nenhuma entrada de estado: o `details` do último `toolResult` com
+  `toolName: "todo"` (sessões gravadas antes das entradas existirem). Entrada de
+  estado, quando há, sempre vence.
+
+Sem a extensão instalada não há snapshot e a lista publicada é vazia: uma única
+frame `tasks: []` por conexão, mais a que `session_sync` reenvia — inofensiva, o
+app não desenha nada para lista vazia.
+
+O tipo de entrada e o shape do snapshot são o contrato de persistência
+publicado pelo próprio pacote (`docs/tool-schema.md`), não um detalhe interno.
+
+### Wire
+
+```jsonc
+// Pi → app, quando a lista muda (e reenviada em `session_sync`)
+{ "type": "todo_state", "tasks": [
+  { "id": 1, "subject": "Adaptar o app", "status": "in_progress",
+    "active_form": "implementando o balão" },
+  { "id": 2, "subject": "Rodar testes", "status": "pending", "blocked_by": [1] }
+] }
+{ "type": "todo_state", "tasks": [] }  // sem lista
+```
+
+### Semântica
+
+- `tasks` é a lista inteira, em ordem de id, com as linhas **não deletadas**:
+  tombstones (`deleted`) ficam no Pi. `active_form` é o rótulo do que está em
+  progresso; `blocked_by` são as dependências; `owner` é quem a tarefa foi
+  atribuída. `status` traz os valores conhecidos (`pending` / `in_progress` /
+  `completed`) e o app aceita outros: um pacote mais novo que acrescente um
+  estado continua aparecendo, só o glifo é o neutro. Linhas sem `subject` não
+  são publicadas (não há como identificá-las na lista).
+- `description` e `metadata` **não** vão no wire: são anotação do agente, nunca
+  renderizadas na lista.
+- `tasks: []` significa "sem lista" — sessão nova, lista limpa com
+  `/todos`-style `clear`, rewind de branch, ou pacote ausente. O app esconde o
+  balão; não é um erro.
+- Broadcast só quando a lista muda (comparação serializada), então uma sessão
+  sem atividade de todo fica silenciosa.
+- `session_new` e substituição de sessão (`/new`, `/resume`, `/fork`) publicam a
+  lista da sessão nova — a que o branch dela tiver: vazia no `/new`, a lista
+  restaurada no `/resume`. O app substitui o que estava mostrando.
+- `session_sync` responde o `todo_state` atual **depois** do `session_history`,
+  por sender — a lista não faz parte do espelho de histórico, então um device
+  que conecta depois (ou reconecta) só a conhece por aqui.
+- Relay inalterado; sem mudança de envelope nem de criptografia.
+
+---
+
 ## Pareamento
 
 QR code mostra Pi-pubkey + room hint + token de uso único.
