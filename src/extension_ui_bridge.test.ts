@@ -97,6 +97,29 @@ describe("extension_ui_bridge", () => {
     expect(req.ask?.questions[0]?.options[1]?.description).toBe("second choice");
   });
 
+  it("forwards the optional whole-ask note with a rich answer", () => {
+    const bus = fakeBus();
+    const bridge = createExtensionUiBridge(fakePi(bus), () => {})!;
+
+    bridge.respond({
+      type: "extension_ui_response",
+      id: "tool:tc_1",
+      ask: {
+        flow_id: "tool:tc_1",
+        kind: "answer",
+        mode: "submit",
+        answers: { goal: { values: ["a"] } },
+        note: "also update the changelog",
+      },
+    });
+
+    const submits = bus.emitted.filter((e) => e.name === SUBMIT);
+    expect(submits).toHaveLength(1);
+    expect(submits[0]?.data).toMatchObject({
+      response: { note: "also update the changelog" },
+    });
+  });
+
   it("forwards a rich answer back to pi-ask as a single submit", () => {
     const bus = fakeBus();
     const bridge = createExtensionUiBridge(fakePi(bus), () => {})!;

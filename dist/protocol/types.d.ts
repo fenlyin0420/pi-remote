@@ -63,6 +63,9 @@ export type AskResponseEnrichmentWire = {
     kind: "answer";
     mode?: "submit" | "elaborate";
     answers: Record<string, AskAnswerWire>;
+    /** Optional whole-ask note from the app sheet; forwarded verbatim to
+     *  pi-ask's submit event, where it becomes `details.note`. */
+    note?: string;
 } | {
     flow_id: string;
     kind: "cancel";

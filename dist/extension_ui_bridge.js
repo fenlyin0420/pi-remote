@@ -160,6 +160,7 @@ export function createExtensionUiBridge(pi, broadcast) {
                 kind: "answer",
                 mode: ask.mode,
                 answers: ask.answers,
+                note: ask.note,
             });
             return;
         }

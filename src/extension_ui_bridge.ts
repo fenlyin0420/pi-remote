@@ -229,6 +229,7 @@ export function createExtensionUiBridge(
         kind: "answer",
         mode: ask.mode,
         answers: ask.answers,
+        note: ask.note,
       });
       return;
     }
@@ -266,6 +267,7 @@ export function createExtensionUiBridge(
           kind: "answer";
           mode?: "submit" | "elaborate";
           answers: Record<string, AskAnswerWire>;
+          note?: string;
         }
       | { kind: "cancel" },
   ): void {
