@@ -27,7 +27,6 @@ beforeEach(() => {
   delete process.env["REMOTE_PI_DIRECT_CONFIG"];
   delete process.env["REMOTE_PI_DAEMON"];
 });
-
 // ── Mock RelayClient ──────────────────────────────────────────────────────────
 
 const relayRef: { current: MockRelay | null } = { current: null };
@@ -227,6 +226,8 @@ const {
   _mapAgentMessagesToEvents,
   THINKING_EVENT_MAX_CHARS,
   _setMessageBufferForTest,
+  _flushStreamDeltasForTest,
+  _resetStreamDeltasForTest,
   _seedMessageBufferFromSession,
   _resetHistorySeedForTest,
   _setSessionStartedAtForTest,
@@ -1294,7 +1295,10 @@ describe("multi-channel broadcast (W2D)", () => {
     // Seed _currentTurnId by simulating a terminal input first.
     onInput({ source: "terminal", text: "hello" } as unknown as Parameters<typeof onInput>[0]);
     const sendsBefore = relayRef.current!.send.mock.calls.length;
+    // Streamed deltas are coalesced (STREAM_DELTA_FLUSH_MS) instead of going
+    // out one per token — flush the buffer to see the frame they become.
     onUpdate({ assistantMessageEvent: { type: "text_delta", delta: "hi" } } as unknown as Parameters<typeof onUpdate>[0]);
+    _flushStreamDeltasForTest();
 
     const sent = relayRef.current!.send.mock.calls.slice(sendsBefore)
       .map((c) => c[0] as string).map(decodeSentCt);
@@ -1317,6 +1321,7 @@ describe("multi-channel broadcast (W2D)", () => {
     onUpdate({
       assistantMessageEvent: { type: "thinking_delta", delta: "weighing options" },
     } as unknown as Parameters<typeof onUpdate>[0]);
+    _flushStreamDeltasForTest();
 
     const sent = relayRef.current!.send.mock.calls.slice(sendsBefore)
       .map((c) => c[0] as string).map(decodeSentCt);
@@ -1337,11 +1342,90 @@ describe("multi-channel broadcast (W2D)", () => {
     onUpdate({
       assistantMessageEvent: { type: "text_delta", delta: "hi" },
     } as unknown as Parameters<typeof onUpdate>[0]);
+    _flushStreamDeltasForTest();
 
     const sent = relayRef.current!.send.mock.calls.slice(sendsBefore)
       .map((c) => c[0] as string).map(decodeSentCt);
     expect(sent.filter((d) => d.inner.type === "agent_thinking")).toHaveLength(0);
     expect(sent.filter((d) => d.inner.type === "agent_chunk")).toHaveLength(1);
+  });
+
+  // The SDK emits one `message_update` per token, and the measured delta is a
+  // few characters (median 3). One relay frame per token is what makes a long
+  // turn cost more data than the files it produced, so deltas are coalesced.
+  test("consecutive text deltas leave as one frame, in order", async () => {
+    await _pairForTest("ownerA__1234567890");
+    const onUpdate = captureEventHandler("message_update");
+    const onInput = captureEventHandler("input");
+    onInput({ source: "terminal", text: "hello" } as unknown as Parameters<typeof onInput>[0]);
+    const sendsBefore = relayRef.current!.send.mock.calls.length;
+
+    for (const delta of ["a", "b", "c"]) {
+      onUpdate({ assistantMessageEvent: { type: "text_delta", delta } } as unknown as Parameters<typeof onUpdate>[0]);
+    }
+    // Nothing on the wire until the window closes.
+    expect(relayRef.current!.send.mock.calls.length).toBe(sendsBefore);
+    _flushStreamDeltasForTest();
+
+    const sent = relayRef.current!.send.mock.calls.slice(sendsBefore)
+      .map((c) => c[0] as string).map(decodeSentCt)
+      .filter((d) => d.inner.type === "agent_chunk");
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.inner).toMatchObject({ delta: "abc" });
+  });
+
+  test("thinking leaves before text, so the app closes the segment in order", async () => {
+    await _pairForTest("ownerA__1234567890");
+    const onUpdate = captureEventHandler("message_update");
+    const onInput = captureEventHandler("input");
+    onInput({ source: "terminal", text: "think" } as unknown as Parameters<typeof onInput>[0]);
+    const sendsBefore = relayRef.current!.send.mock.calls.length;
+
+    onUpdate({ assistantMessageEvent: { type: "thinking_delta", delta: "hmm" } } as unknown as Parameters<typeof onUpdate>[0]);
+    onUpdate({ assistantMessageEvent: { type: "text_delta", delta: "answer" } } as unknown as Parameters<typeof onUpdate>[0]);
+    _flushStreamDeltasForTest();
+
+    const kinds = relayRef.current!.send.mock.calls.slice(sendsBefore)
+      .map((c) => c[0] as string).map(decodeSentCt)
+      .map((d) => d.inner.type)
+      .filter((t) => t === "agent_thinking" || t === "agent_chunk");
+    expect(kinds).toEqual(["agent_thinking", "agent_chunk"]);
+  });
+
+  test("a tool flushes the answer that led to it", async () => {
+    await _pairForTest("ownerA__1234567890");
+    const onUpdate = captureEventHandler("message_update");
+    const onInput = captureEventHandler("input");
+    const onToolStart = captureEventHandler("tool_execution_start");
+    onInput({ source: "terminal", text: "go" } as unknown as Parameters<typeof onInput>[0]);
+    const sendsBefore = relayRef.current!.send.mock.calls.length;
+
+    onUpdate({ assistantMessageEvent: { type: "text_delta", delta: "let me look" } } as unknown as Parameters<typeof onUpdate>[0]);
+    onToolStart({ toolCallId: "tc-1", toolName: "read", args: { path: "/tmp/x" } } as unknown as Parameters<typeof onToolStart>[0]);
+
+    const kinds = relayRef.current!.send.mock.calls.slice(sendsBefore)
+      .map((c) => c[0] as string).map(decodeSentCt)
+      .map((d) => d.inner.type)
+      .filter((t) => t === "agent_chunk" || t === "tool_request");
+    expect(kinds).toEqual(["agent_chunk", "tool_request"]);
+  });
+
+  test("the tail of a turn reaches the app before agent_done", async () => {
+    await _pairForTest("ownerA__1234567890");
+    const onUpdate = captureEventHandler("message_update");
+    const onInput = captureEventHandler("input");
+    const onAgentEnd = captureEventHandler("agent_end");
+    onInput({ source: "terminal", text: "go" } as unknown as Parameters<typeof onInput>[0]);
+    const sendsBefore = relayRef.current!.send.mock.calls.length;
+
+    onUpdate({ assistantMessageEvent: { type: "text_delta", delta: "done" } } as unknown as Parameters<typeof onUpdate>[0]);
+    onAgentEnd({} as unknown as Parameters<typeof onAgentEnd>[0]);
+
+    const kinds = relayRef.current!.send.mock.calls.slice(sendsBefore)
+      .map((c) => c[0] as string).map(decodeSentCt)
+      .map((d) => d.inner.type)
+      .filter((t) => t === "agent_chunk" || t === "agent_done");
+    expect(kinds).toEqual(["agent_chunk", "agent_done"]);
   });
 
   test("a reasoning block is timed live and attached to its message", async () => {
@@ -2874,6 +2958,7 @@ describe("user_input mirroring", () => {
       message: {},
       assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "hi", partial: {} },
     });
+    _flushStreamDeltasForTest();
 
     const allSent = relayRef.current!.send.mock.calls.map((c) => c[0] as string);
     const chunks = allSent.map(decodeSentCt).filter((d) => d.inner.type === "agent_chunk");

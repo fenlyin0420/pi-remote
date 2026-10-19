@@ -344,6 +344,27 @@ são enviados. O `text` replayado é truncado por bloco (16 KiB) pra preservar o
 orçamento de bytes do mirror; o streaming ao vivo não tem limite. Modelos sem
 superfície de reasoning não são afetados: nenhum frame novo é emitido.
 
+### Granularidade do streaming (`agent_chunk` / `agent_thinking`)
+
+O SDK emite um `message_update` por token, e o delta medido numa sessão real é
+de poucos caracteres (mediana 3, p90 7). Um frame de relay por token custa
+~240 bytes de envelope para 3 bytes de texto — e, pior, cada frame vira um
+segmento TCP/TLS próprio, então o rádio do telefone nunca ociosa enquanto a turn
+dura. Por isso os deltas são **coalescidos** antes de ir pro fio:
+
+- janela de 40 ms (`STREAM_DELTA_FLUSH_MS`); texto e thinking acumulam na mesma janela;
+- a ordem entre os dois é preservada: um flush sempre emite `agent_thinking`
+  antes de `agent_chunk` da mesma janela (o app fecha o segmento de raciocínio
+  no primeiro frame de texto);
+- todo limite que introduz um frame diferente faz flush primeiro —
+  `tool_execution_start`/`end`, `message_end`, `agent_end`, e o teardown do
+  relay (`/remote-pi stop`) — então nenhum delta é reordenado nem perdido;
+- o último delta da turn sai **antes** do `agent_done`.
+
+Nada muda no shape dos frames: o app recebe o mesmo texto, na mesma ordem, em
+menos frames. Clientes antigos não percebem diferença além do streaming chegar
+em pedaços um pouco maiores.
+
 ### Resultado de tool com diff (`edit`)
 
 `tool_result` ganhou um campo opcional `diff` (aditivo; clientes antigos

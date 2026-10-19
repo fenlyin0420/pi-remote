@@ -1558,6 +1558,75 @@ let _messageBuffer = [];
 // the app showed live.
 let _thinkingStartedAt = null;
 let _pendingThinkingDurations = [];
+// ── Streaming delta coalescing ──────────────────────────────────────────────
+//
+// The SDK emits one `message_update` per token, and a fast model produces
+// deltas of a few characters (measured on a live session: median 3, p90 7).
+// Forwarding each one as its own relay frame costs ~240 bytes of envelope per
+// 3 bytes of text — but the real price is that every frame is its own TCP/TLS
+// segment, so the phone's radio never idles for the length of the turn. That is
+// what made a long turn cost more data than the files it produced.
+//
+// So deltas accumulate per kind and leave on a short timer. The app receives
+// the same text in the same order, a few frames later: the ordering ACROSS
+// kinds is preserved because a flush always emits thinking before text (the app
+// closes a reasoning segment at the first text frame), and every boundary that
+// introduces a different frame — a tool, a message end, the end of the turn —
+// flushes first, so nothing is ever reordered past it.
+export const STREAM_DELTA_FLUSH_MS = 40;
+let _pendingStreamText = null;
+let _pendingStreamThinking = null;
+let _streamDeltaTimer;
+/** Accumulate one delta and make sure a flush is scheduled. */
+function _queueStreamDelta(kind, turnId, delta) {
+    if (!delta)
+        return;
+    // A delta for a NEW turn must not merge into the previous turn's buffer: the
+    // pending text belongs to a turn the app is already past.
+    if ((_pendingStreamText && _pendingStreamText.turnId !== turnId) ||
+        (_pendingStreamThinking && _pendingStreamThinking.turnId !== turnId)) {
+        _flushStreamDeltas();
+    }
+    if (kind === "text") {
+        _pendingStreamText = _pendingStreamText
+            ? { turnId, text: _pendingStreamText.text + delta }
+            : { turnId, text: delta };
+    }
+    else {
+        _pendingStreamThinking = _pendingStreamThinking
+            ? { turnId, text: _pendingStreamThinking.text + delta }
+            : { turnId, text: delta };
+    }
+    if (_streamDeltaTimer === undefined) {
+        _streamDeltaTimer = setTimeout(() => {
+            _streamDeltaTimer = undefined;
+            _flushStreamDeltas();
+        }, STREAM_DELTA_FLUSH_MS);
+        // Never hold the process open for a frame that only a phone would see.
+        _streamDeltaTimer.unref?.();
+    }
+}
+/**
+ * Emit everything accumulated so far, thinking first. Called by the timer, and
+ * eagerly at every boundary where a different frame type is about to be sent.
+ * Safe to call with nothing pending.
+ */
+function _flushStreamDeltas() {
+    if (_streamDeltaTimer !== undefined) {
+        clearTimeout(_streamDeltaTimer);
+        _streamDeltaTimer = undefined;
+    }
+    const thinking = _pendingStreamThinking;
+    const text = _pendingStreamText;
+    _pendingStreamThinking = null;
+    _pendingStreamText = null;
+    if (thinking) {
+        _broadcastToActive({ type: "agent_thinking", in_reply_to: thinking.turnId, delta: thinking.text });
+    }
+    if (text) {
+        _broadcastToActive({ type: "agent_chunk", in_reply_to: text.turnId, delta: text.text });
+    }
+}
 let _pendingSteers = [];
 let _lastConsumedSteerText = null;
 let _queuedItems = [];
@@ -1745,6 +1814,19 @@ export function _resetHistorySeedForTest() {
 }
 export function _setMessageBufferForTest(msgs) {
     _messageBuffer = msgs;
+}
+/** Test-only: flush the coalesced stream deltas now instead of on the timer. */
+export function _flushStreamDeltasForTest() {
+    _flushStreamDeltas();
+}
+/** Test-only: drop any buffered delta + its timer between cases. */
+export function _resetStreamDeltasForTest() {
+    if (_streamDeltaTimer !== undefined) {
+        clearTimeout(_streamDeltaTimer);
+        _streamDeltaTimer = undefined;
+    }
+    _pendingStreamText = null;
+    _pendingStreamThinking = null;
 }
 /** Test-only accessor: returns a defensive copy of the buffer. */
 export function _getMessageBufferForTest() {
@@ -2233,6 +2315,9 @@ async function _findKnownPeer(appPeerIdStd) {
 function _goIdle(byeReason) {
     _rootLifecycleGeneration += 1;
     _relayLifecycleGeneration += 1;
+    // Any delta still buffered has to leave before the channels are torn down
+    // below — and before the `bye` that tells the app this room is offline.
+    _flushStreamDeltas();
     // Broadcast bye to every still-attached owner so each app surfaces
     // "offline" immediately instead of waiting ~50s for a ping miss.
     if (byeReason && _state !== "idle" && _anyPeerActive()) {
@@ -3031,7 +3116,7 @@ const extension = (pi) => {
             return;
         const ae = event.assistantMessageEvent;
         if (ae.type === "text_delta") {
-            _broadcastToActive({ type: "agent_chunk", in_reply_to: _currentTurnId, delta: ae.delta });
+            _queueStreamDelta("text", _currentTurnId, ae.delta);
         }
         else if (ae.type === "thinking_delta") {
             // Reasoning tokens ride the same turn as the answer text; the app keeps
@@ -3040,7 +3125,7 @@ const extension = (pi) => {
             // expose reasoning, so non-reasoning models are byte-identical.
             if (_thinkingStartedAt == null)
                 _thinkingStartedAt = Date.now();
-            _broadcastToActive({ type: "agent_thinking", in_reply_to: _currentTurnId, delta: ae.delta });
+            _queueStreamDelta("thinking", _currentTurnId, ae.delta);
         }
         else if (ae.type === "thinking_start") {
             // Time the block here rather than in the app so the duration survives a
@@ -3060,6 +3145,8 @@ const extension = (pi) => {
     // executes; tool_execution_end closes the loop with the result. Together
     // they render a "Tool running… done" timeline in each paired app.
     pi.on("tool_execution_start", (event) => {
+        // Streamed text belongs before the tool card that follows it.
+        _flushStreamDeltas();
         if (!_anyPeerActive())
             return;
         // `send_to_phone` renders as an attachment card, not a tool card — the
@@ -3088,6 +3175,8 @@ const extension = (pi) => {
         // Queue any image the tool returned before the peer check: the replay has
         // to rebuild the card even when nobody was watching live.
         _queueInlineToolImages(event);
+        // The answer that led to this tool lands before its result.
+        _flushStreamDeltas();
         if (!_anyPeerActive())
             return;
         if (event.toolName === SEND_TO_PHONE_TOOL)
@@ -3124,6 +3213,10 @@ const extension = (pi) => {
         const m = event?.message;
         if (!m)
             return;
+        // Whatever streamed belongs to the message that is now persisted: flush it
+        // before anything this handler emits (the error frame below, the tool
+        // images) can overtake it.
+        _flushStreamDeltas();
         if (m.role === "user" && _anyPeerActive()) {
             _broadcastConsumedSteerForUserContent(m.content);
         }
@@ -3168,6 +3261,9 @@ const extension = (pi) => {
     pi.on("agent_end", () => {
         // Buffer is fed by `message_end`; here we only finalize the outbound
         // turn signal to every connected owner. No buffer mutation.
+        // The last deltas of the turn must reach the app before its `agent_done`,
+        // or the tail of the answer would arrive after the turn looked finished.
+        _flushStreamDeltas();
         _thinkingStartedAt = null;
         _pendingThinkingDurations = [];
         if (_anyPeerActive() && _currentTurnId) {

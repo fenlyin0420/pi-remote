@@ -111,6 +111,7 @@ type BufferMsg = {
      *  file — the app then just omits the timer. */
     thinkingDurations?: number[];
 };
+export declare const STREAM_DELTA_FLUSH_MS = 40;
 type MeshEnvelope = {
     id: string;
     from: string;
@@ -175,6 +176,10 @@ export declare function _resolveContextLimitForTest(ctx: unknown): number | unde
 /** Test-only: allow re-running the one-shot history seed. */
 export declare function _resetHistorySeedForTest(): void;
 export declare function _setMessageBufferForTest(msgs: unknown[]): void;
+/** Test-only: flush the coalesced stream deltas now instead of on the timer. */
+export declare function _flushStreamDeltasForTest(): void;
+/** Test-only: drop any buffered delta + its timer between cases. */
+export declare function _resetStreamDeltasForTest(): void;
 /** Test-only accessor: returns a defensive copy of the buffer. */
 export declare function _getMessageBufferForTest(): unknown[];
 /** Test-only override of session started timestamp. */
