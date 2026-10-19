@@ -1573,7 +1573,14 @@ let _pendingThinkingDurations = [];
 // closes a reasoning segment at the first text frame), and every boundary that
 // introduces a different frame — a tool, a message end, the end of the turn —
 // flushes first, so nothing is ever reordered past it.
-export const STREAM_DELTA_FLUSH_MS = 40;
+//
+// The window is 100 ms rather than the 30–40 ms a chat UI would pick, because
+// the gain is proportional to how fast the model streams and the fast ones are
+// very fast: measured turn rates on a live session run 4–150 tok/s with a
+// median of 94. A 40 ms window collapses that to ~3 frames saved per frame (a
+// 3.3× reduction); 100 ms is 7.9×, and 150 ms 11.8×. At 100 ms the text still
+// lands in ten chunks per second, which reads as smooth on a phone.
+export const STREAM_DELTA_FLUSH_MS = 100;
 let _pendingStreamText = null;
 let _pendingStreamThinking = null;
 let _streamDeltaTimer;

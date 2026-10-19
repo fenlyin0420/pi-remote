@@ -350,9 +350,12 @@ O SDK emite um `message_update` por token, e o delta medido numa sessão real é
 de poucos caracteres (mediana 3, p90 7). Um frame de relay por token custa
 ~240 bytes de envelope para 3 bytes de texto — e, pior, cada frame vira um
 segmento TCP/TLS próprio, então o rádio do telefone nunca ociosa enquanto a turn
-dura. Por isso os deltas são **coalescidos** antes de ir pro fio:
+dura. A janela precisa acompanhar a velocidade do modelo: as turnos medidas vão
+de 4 a 150 tok/s com mediana de 94, então 40 ms só reduziria 3,3× — 100 ms
+reduz 7,9× e 150 ms 11,8×. Por isso os deltas são **coalescidos** antes de ir
+pro fio:
 
-- janela de 40 ms (`STREAM_DELTA_FLUSH_MS`); texto e thinking acumulam na mesma janela;
+- janela de 100 ms (`STREAM_DELTA_FLUSH_MS`); texto e thinking acumulam na mesma janela;
 - a ordem entre os dois é preservada: um flush sempre emite `agent_thinking`
   antes de `agent_chunk` da mesma janela (o app fecha o segmento de raciocínio
   no primeiro frame de texto);

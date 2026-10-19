@@ -111,7 +111,7 @@ type BufferMsg = {
      *  file — the app then just omits the timer. */
     thinkingDurations?: number[];
 };
-export declare const STREAM_DELTA_FLUSH_MS = 40;
+export declare const STREAM_DELTA_FLUSH_MS = 100;
 type MeshEnvelope = {
     id: string;
     from: string;
