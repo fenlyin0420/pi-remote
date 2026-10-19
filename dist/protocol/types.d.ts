@@ -186,6 +186,7 @@ export type ClientMessage = {
     type: "session_sync";
     id: string;
     limit?: number;
+    since?: string;
 } | {
     type: "session_new";
     id: string;
@@ -489,6 +490,19 @@ export type ServerMessage = {
     events: SessionHistoryEvent[];
     eos: boolean;
     truncated: boolean;
+    /**
+     * `"full"` (or absent, on an older Pi): `events` is the whole mirror and
+     * the app SUBSTITUTES its cache with it. `"delta"`: `events` are only the
+     * ones after the cursor the app sent, to be APPENDED.
+     */
+    mode?: "full" | "delta";
+    /**
+     * Opaque resume token for the last event in `events` — the app stores it
+     * per session and echoes it as `session_sync.since` next time. Opaque on
+     * purpose: only the Pi interprets it, so its shape can change without a
+     * protocol bump. Absent when there is nothing to resume from.
+     */
+    cursor?: string;
 } | {
     type: "action_ok";
     in_reply_to: string;

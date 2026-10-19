@@ -773,6 +773,73 @@ publicado pelo próprio pacote (`docs/tool-schema.md`), não um detalhe interno.
 
 ---
 
+## Histórico incremental (`session_sync.since`)
+
+O `session_history` nasceu como espelho completo: o app SUBSTITUI o cache local
+pelo que chega. Isso custa caro, porque o app pede sync em três momentos (entrar
+no chat, aresta de online, e o debounce pós-conexão) e um reconnect pode disparar
+dois deles. Medido em nove dias de uso normal: 1564 replays, 911 MB de JSON de
+eventos, um único room reenviando os mesmos 526 KB dez vezes em noventa segundos.
+
+O caminho rápido é um delta. O Pi continua sendo a autoridade e o replay
+completo continua existindo como fallback.
+
+### Wire
+
+```jsonc
+// App → Pi (campo aditivo: Pi antigo ignora e responde o espelho completo)
+{ "type": "session_sync", "id": "sync-1", "since": "1700000000000:9f2c…" }
+
+// Pi → App
+{ "type": "session_history", "in_reply_to": "sync-1",
+  "session_started_at": 1700000000000,
+  "mode": "delta",            // ausente = Pi antigo → tratar como "full"
+  "cursor": "1700000000000:4a1b…",
+  "events": [ /* só os que vieram depois do cursor */ ],
+  "eos": true, "truncated": false }
+```
+
+### O cursor
+
+`<session_started_at>:<sha256 dos campos do evento, primeiros 16 hex>`.
+
+Endereçado por conteúdo de propósito: o replay corta do **mais antigo** para
+caber no orçamento de bytes, então um índice ou uma contagem se desloca debaixo
+do pé do app — o evento em si não. O prefixo da sessão faz um cursor de uma
+sessão anterior (`/resume`, `/fork`, `session_new`) falhar a busca, que é
+exatamente o que o app precisa nesse caso.
+
+O cursor é **opaco**: só o Pi o interpreta. O app guarda o que recebeu e devolve
+igual; mudar o formato não é quebra de protocolo.
+
+### Decisão do Pi
+
+1. procura o cursor entre os eventos mapeados, **de trás para frente** (uma
+   conversa pode conter dois eventos idênticos; retomar depois do último é a
+   leitura que nunca reenvia o que o app já tem);
+2. achou → responde `mode: "delta"` com os eventos seguintes (pode ser vazio);
+3. não achou (sessão diferente, evento cortado pelo orçamento) → `mode: "full"`,
+   o comportamento antigo;
+4. o delta passou do orçamento → também `mode: "full"`. Um delta parcial deixaria
+   o cursor do app apontando para o meio dele.
+
+O `cursor` acompanha **sempre** o último evento da resposta — inclusive numa
+resposta truncada, para que o próximo sync seja um delta mesmo quando este
+precisou descartar os eventos mais antigos.
+
+### No app
+
+- O cursor vive no índice da sessão (`SessionIndexRecord.syncCursor`), então um
+  cold start retoma em vez de rebaixar o histórico inteiro.
+- `mode: "delta"` é **append**: as linhas já gravadas + as novas passam pelo
+  mesmo reconcile (carregar blobs em cache, restaurar fotos que um replay sem
+  bytes apagaria, diff de escrita mínima). O delta continua a numeração de `seq`
+  a partir das linhas existentes — alguns ids de linha embutem essa posição.
+- Um `session_history` sem `mode` (Pi antigo) ou com `mode: "full"` continua
+  substituindo o cache, exatamente como antes.
+
+---
+
 ## Pareamento
 
 QR code mostra Pi-pubkey + room hint + token de uso único.

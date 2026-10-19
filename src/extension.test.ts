@@ -4164,6 +4164,143 @@ describe("session sync", () => {
     delete process.env["REMOTE_PI_SYNC_LIMIT"];
   });
 
+  // Replaying the whole mirror on every reconnect/re-entry was the single
+  // biggest data cost measured (911 MB of event JSON in nine days; one room sent
+  // the same 526 KB ten times in ninety seconds). The app now echoes the cursor
+  // of its newest event and gets only what came after it.
+  describe("incremental replay (cursor)", () => {
+    function lastHistory(sendsBefore: number) {
+      return (relayRef.current!.send.mock.calls.slice(sendsBefore)
+        .map((c) => c[0] as string))
+        .map(decodeSentCt)
+        .find((d) => d.inner.type === "session_history")!;
+    }
+
+    function seed(count = 4) {
+      const ts = 1_700_000_000_000;
+      _setSessionStartedAtForTest(ts);
+      _setMessageBufferForTest(
+        Array.from({ length: count }, (_, i) => ({
+          role: "user",
+          content: `m${i}`,
+          timestamp: ts + i,
+        } as { role: string; content: unknown; timestamp: number })),
+      );
+      return ts;
+    }
+
+    /** Pair, seed a session, and return the cursor of a full replay. */
+    async function seedAndSync(peer: string): Promise<{ cursor: string; ts: number }> {
+      await _pairForTest(peer);
+      const ts = seed();
+      const sendsBefore = relayRef.current!.send.mock.calls.length;
+      routeClientMessage(
+        { type: "session_sync", id: "seed" },
+        { abort: () => undefined },
+      );
+      const h = lastHistory(sendsBefore);
+      return { cursor: h.inner["cursor"] as string, ts };
+    }
+
+    test("a full replay carries mode:full and a cursor", async () => {
+      const { cursor } = await seedAndSync("peer-cursor-1");
+      expect(cursor).toMatch(/^1700000000000:[0-9a-f]{16}$/);
+    });
+
+    test("nothing new → an empty delta, not a full replay", async () => {
+      const { cursor } = await seedAndSync("peer-cursor-2");
+      const sendsBefore = relayRef.current!.send.mock.calls.length;
+      routeClientMessage(
+        { type: "session_sync", id: "again", since: cursor },
+        { abort: () => undefined },
+      );
+      const h = lastHistory(sendsBefore);
+      expect(h.inner["mode"]).toBe("delta");
+      expect(h.inner["events"]).toHaveLength(0);
+      expect(h.inner["cursor"]).toBe(cursor);
+    });
+
+    test("a new turn → only that turn's events", async () => {
+      const { cursor, ts } = await seedAndSync("peer-cursor-3");
+      _setMessageBufferForTest(
+        Array.from({ length: 5 }, (_, i) => ({
+          role: "user",
+          content: `m${i}`,
+          timestamp: ts + i,
+        } as { role: string; content: unknown; timestamp: number })),
+      );
+      const sendsBefore = relayRef.current!.send.mock.calls.length;
+      routeClientMessage(
+        { type: "session_sync", id: "next", since: cursor },
+        { abort: () => undefined },
+      );
+      const h = lastHistory(sendsBefore);
+      expect(h.inner["mode"]).toBe("delta");
+      const events = h.inner["events"] as Array<{ ts: number }>;
+      expect(events).toHaveLength(1);
+      expect(events[0]!.ts).toBe(ts + 4);
+      // The new cursor points at the event just sent, so the next sync resumes
+      // from there.
+      expect(h.inner["cursor"]).not.toBe(cursor);
+    });
+
+    test("a cursor from another session falls back to a full replay", async () => {
+      await _pairForTest("peer-cursor-4");
+      seed(1);
+      const sendsBefore = relayRef.current!.send.mock.calls.length;
+      // A `/resume` restamped the session: the app's cursor belongs to the OLD
+      // one, so "everything after it" would be meaningless.
+      routeClientMessage(
+        { type: "session_sync", id: "stale", since: `1:${"a".repeat(16)}` },
+        { abort: () => undefined },
+      );
+      const h = lastHistory(sendsBefore);
+      expect(h.inner["mode"]).toBe("full");
+      expect(h.inner["events"]).toHaveLength(1);
+    });
+
+    test("a cursor that is not in the mirror falls back to a full replay", async () => {
+      const { ts } = await seedAndSync("peer-cursor-5");
+      const sendsBefore = relayRef.current!.send.mock.calls.length;
+      routeClientMessage(
+        // Right session, unknown event: the budget may have trimmed it.
+        { type: "session_sync", id: "gone", since: `${ts}:${"b".repeat(16)}` },
+        { abort: () => undefined },
+      );
+      const h = lastHistory(sendsBefore);
+      expect(h.inner["mode"]).toBe("full");
+      expect(h.inner["events"]).toHaveLength(4);
+    });
+
+    test("a truncated full replay still yields a usable cursor", async () => {
+      process.env["REMOTE_PI_SYNC_LIMIT"] = "2";
+      await _pairForTest("peer-cursor-6");
+      seed(6);
+      const sendsBefore = relayRef.current!.send.mock.calls.length;
+      routeClientMessage(
+        { type: "session_sync", id: "trunc" },
+        { abort: () => undefined },
+      );
+      const first = lastHistory(sendsBefore);
+      expect(first.inner["truncated"]).toBe(true);
+      expect(first.inner["events"]).toHaveLength(2);
+      const cursor = first.inner["cursor"] as string;
+
+      // Resuming from it: the two events the app got are the base, and the
+      // events the limit dropped are the delta.
+      const sends2 = relayRef.current!.send.mock.calls.length;
+      routeClientMessage(
+        { type: "session_sync", id: "trunc2", since: cursor },
+        { abort: () => undefined },
+      );
+      const second = lastHistory(sends2);
+      expect(second.inner["mode"]).toBe("delta");
+      expect(second.inner["events"]).toHaveLength(0);
+
+      delete process.env["REMOTE_PI_SYNC_LIMIT"];
+    });
+  });
+
   test("mapping: assistant with TextContent + ToolCall → 2 events", () => {
     const ts = 1_700_000_000_000;
     const events = _mapAgentMessagesToEvents([

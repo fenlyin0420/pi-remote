@@ -6986,17 +6986,59 @@ function _handleSessionSync(
       events: [],
       eos: true,
       truncated: false,
+      mode: "full",
     });
     return;
   }
 
-  // Mirror semantics: always return the last N events. App SUBSTITUTES its
-  // local cache with this response — no delta/since_ts logic.
+  // Mirror semantics: the app SUBSTITUTES its local cache with this reply, so a
+  // full replay is the fallback for everything below. The fast path is the
+  // delta: an app that reconnects or re-enters a room it already holds sends the
+  // cursor of its last event back, and gets only what came after it.
+  //
+  // Why it matters: measured over nine days of ordinary use, one room replayed
+  // the same 526 KB mirror ten times in ninety seconds (entry + online edge +
+  // the post-connect debounce), and 352 of 1564 replays were over a megabyte.
+  // Nine of those ten arrived at an app whose rows already matched — the reply
+  // produced zero writes.
   const serverLimit = _getSyncLimit();
   const requested = msg.limit ?? serverLimit;
   const effectiveLimit = Math.min(requested, serverLimit);  // server clamps
 
   const allEvents = _mapAgentMessagesToEvents(_messageBuffer);
+
+  // Delta path: resume from the event the app last saw.
+  const resumeAt = msg.since ? _findEventByCursor(allEvents, msg.since) : -1;
+  if (resumeAt >= 0) {
+    const delta = allEvents.slice(resumeAt + 1);
+    const bytes = _jsonBytes(delta);
+    // A delta that outgrew the budget is not split — a partial delta would leave
+    // the app's cursor pointing into the middle of it. Fall back to a full
+    // replay, which the app applies as a wholesale substitute.
+    if (bytes <= _getSyncMaxBytes()) {
+      process.stderr.write(
+        `[remote-pi] session_history: delta ${delta.length} events, ` +
+        `${Math.round(bytes / 1024)} KB (resumed at ${resumeAt + 1}/${allEvents.length})\n`,
+      );
+      sender.send({
+        type: "session_history",
+        in_reply_to: msg.id,
+        session_started_at: _sessionStartedAt,
+        events: delta,
+        eos: true,
+        truncated: false,
+        mode: "delta",
+        cursor: _eventCursor(allEvents, allEvents.length - 1),
+      });
+      _sendSyncTail(sender);
+      return;
+    }
+    process.stderr.write(
+      `[remote-pi] session_history: delta too large (${Math.round(bytes / 1024)} KB), ` +
+      `falling back to a full replay\n`,
+    );
+  }
+
   const slice = effectiveLimit > 0 ? allEvents.slice(-effectiveLimit) : [];
   // LOCAL PATCH (fenlyin): fit the reply to the budget by dropping the OLDEST
   // events (the relay would otherwise reject the whole envelope, and the app
@@ -7014,7 +7056,8 @@ function _handleSessionSync(
   // history" — the reply size and whether anything was dropped.
   process.stderr.write(
     `[remote-pi] session_history: ${events.length}/${allEvents.length} events, ` +
-    `${Math.round(bytes / 1024)} KB, truncated=${truncated}\n`,
+    `${Math.round(bytes / 1024)} KB, truncated=${truncated}` +
+    `${msg.since ? ` (cursor not found: ${msg.since.slice(0, 24)})` : ""}\n`,
   );
 
   sender.send({
@@ -7024,8 +7067,21 @@ function _handleSessionSync(
     events,
     eos: true,
     truncated,
+    mode: "full",
+    // The cursor always describes the LAST event of the reply — the one the app
+    // can resume after. A truncated replay still gives a usable cursor, so the
+    // next sync is a delta even when this one had to drop the oldest events.
+    cursor: _eventCursor(allEvents, allEvents.length - 1),
   });
 
+  _sendSyncTail(sender);
+}
+
+/**
+ * Per-sender frames that always follow a `session_history`, in this order.
+ * Split out because both the full and the delta path end with it.
+ */
+function _sendSyncTail(sender: PlainPeerChannel): void {
   // Plan/57 — replay ask_user flows still awaiting an answer. The bridge
   // broadcasts `started` once; a peer that connects afterwards would otherwise
   // see the tool call as plain history text while the desktop stays blocked on
@@ -7042,6 +7098,57 @@ function _handleSessionSync(
   // that connects later — or reconnects after a restart — would never learn it.
   // Replayed per-sender, after the history.
   if (_todoBridge) sender.send(_todoBridge.current());
+}
+
+/**
+ * The resume token for the event at `index`.
+ *
+ * Content-addressed on purpose: the replay trims from the OLDEST end to fit its
+ * byte budget, so an index or a count shifts under the app's feet, while the
+ * event itself does not. `<session>:<hash>` also makes a cursor from a previous
+ * session (a `/resume`, a `session_new`) fail the lookup and fall back to a full
+ * replay — which is exactly what the app needs then.
+ *
+ * Opaque by contract: only the Pi interprets it (see `session_history.cursor`).
+ */
+function _eventCursor(events: SessionHistoryEvent[], index: number): string | undefined {
+  const ev = index >= 0 && index < events.length ? events[index] : undefined;
+  if (!ev) return undefined;
+  const hash = createHash("sha256").update(_jsonBytesKey(ev)).digest("hex").slice(0, 16);
+  return `${_sessionStartedAt ?? 0}:${hash}`;
+}
+
+/** Stable string an event hashes to — independent of key order. */
+function _jsonBytesKey(ev: SessionHistoryEvent): string {
+  const ordered = Object.keys(ev)
+    .sort()
+    .map((k) => `${k}=${JSON.stringify((ev as Record<string, unknown>)[k])}`)
+    .join("\u0001");
+  return ordered;
+}
+
+/**
+ * Index of the event a cursor points at, or -1 when it is not in `events`.
+ *
+ * Searched from the END: the cursor names the newest event the app holds, and a
+ * replayed conversation can legitimately contain two identical events (the same
+ * text twice). Resuming after the LAST one is the reading that never re-sends
+ * something the app already has.
+ */
+function _findEventByCursor(events: SessionHistoryEvent[], cursor: string): number {
+  const sep = cursor.indexOf(":");
+  if (sep <= 0) return -1;
+  const session = cursor.slice(0, sep);
+  const hash = cursor.slice(sep + 1);
+  // A cursor minted by a DIFFERENT session must not match: the app would then
+  // receive "everything after some event of the previous conversation".
+  if (session !== String(_sessionStartedAt ?? 0)) return -1;
+  for (let i = events.length - 1; i >= 0; i--) {
+    const ev = events[i]!;
+    const h = createHash("sha256").update(_jsonBytesKey(ev)).digest("hex").slice(0, 16);
+    if (h === hash) return i;
+  }
+  return -1;
 }
 
 /**

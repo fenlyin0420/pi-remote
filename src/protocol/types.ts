@@ -208,7 +208,7 @@ export type ClientMessage =
   | { type: "approve_tool"; id: string; tool_call_id: string; decision: "allow" | "deny" }
   | { type: "cancel"; id: string; target_id: string }
   | { type: "ping"; id: string }
-  | { type: "session_sync"; id: string; limit?: number }
+  | { type: "session_sync"; id: string; limit?: number; since?: string }
   // Plan/28 — Typed app actions on the paired Pi session. Each carries a
   // structured payload (no string parsing) and gets either `action_ok` or
   // `action_error` back. Visible side-effects (chat output, model change
@@ -498,6 +498,19 @@ export type ServerMessage =
       events: SessionHistoryEvent[];
       eos: boolean;
       truncated: boolean;
+      /**
+       * `"full"` (or absent, on an older Pi): `events` is the whole mirror and
+       * the app SUBSTITUTES its cache with it. `"delta"`: `events` are only the
+       * ones after the cursor the app sent, to be APPENDED.
+       */
+      mode?: "full" | "delta";
+      /**
+       * Opaque resume token for the last event in `events` — the app stores it
+       * per session and echoes it as `session_sync.since` next time. Opaque on
+       * purpose: only the Pi interprets it, so its shape can change without a
+       * protocol bump. Absent when there is nothing to resume from.
+       */
+      cursor?: string;
     }
   // Plan/28 — Replies for typed app actions.
   // `action_ok` / `action_error` carry the original `ActionName` so the
