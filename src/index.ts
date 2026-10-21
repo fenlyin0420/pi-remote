@@ -48,6 +48,7 @@ import { SettingsManager, SessionManager, convertToPng, getShellConfig } from "@
 // from the same files.
 import { ModelRegistry as _RealModelRegistry, AuthStorage as _RealAuthStorage } from "@earendil-works/pi-coding-agent";
 import { type Ed25519Keypair } from "./pairing/crypto.js";
+import { logDiag } from "./log.js";
 import { buildQRUri, qrSession, renderQRAscii, clampPairTtlMs, TOKEN_TTL_MS } from "./pairing/qr.js";
 import {
   addPeer,
@@ -762,7 +763,7 @@ async function _collectReceivedImagePreviews(msg: ClientUserMessage): Promise<Re
     const mime = typeof image?.mime === "string" ? image.mime : "unknown";
 
     if (!image || typeof image.data !== "string") {
-      console.error(`[remote-pi] malformed image in message ${msg.id} index=${i}`);
+      logDiag(`[remote-pi] malformed image in message ${msg.id} index=${i}`);
       previews.push({
         messageId: msg.id,
         index: i,
@@ -776,7 +777,7 @@ async function _collectReceivedImagePreviews(msg: ClientUserMessage): Promise<Re
 
     const decoded = _decodeImagePayload(image.data, image.mime);
     if (!decoded.ok) {
-      console.error(`[remote-pi] skipped image id=${msg.id} index=${i}: ${decoded.reason}`);
+      logDiag(`[remote-pi] skipped image id=${msg.id} index=${i}: ${decoded.reason}`);
       previews.push({
         messageId: msg.id,
         index: i,
@@ -790,7 +791,7 @@ async function _collectReceivedImagePreviews(msg: ClientUserMessage): Promise<Re
 
     const ext = _imageExtension(image.mime);
     if (!ext) {
-      console.error(`[remote-pi] unsupported image mime in message ${msg.id} index=${i}: ${image.mime}`);
+      logDiag(`[remote-pi] unsupported image mime in message ${msg.id} index=${i}: ${image.mime}`);
       previews.push({
         messageId: msg.id,
         index: i,
@@ -829,7 +830,7 @@ async function _collectReceivedImagePreviews(msg: ClientUserMessage): Promise<Re
       });
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
-      console.error(`[remote-pi] failed saving image id=${msg.id} index=${i}: ${detail}`);
+      logDiag(`[remote-pi] failed saving image id=${msg.id} index=${i}: ${detail}`);
       previews.push({
         messageId: msg.id,
         index: i,
@@ -981,7 +982,7 @@ function _rememberAttachmentForHistory(meta: AttachmentMeta): void {
   } catch (err) {
     // The card is already broadcast and buffered; failing to persist it only
     // costs the replay, so this must not take the turn down with it.
-    console.error(
+    logDiag(
       `[remote-pi] could not persist attachment ${meta.id}: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
@@ -1048,7 +1049,7 @@ function _queueInlineToolImages(event: {
     result.ok ? [{ meta: { ...result.meta, tool_call_id: toolCallId }, data: result.data }] : []))
     .catch((err) => {
       // Never let a bad image take a turn down; the tool result already stands.
-      console.error(
+      logDiag(
         `[remote-pi] could not forward a tool image (${String(event.toolName)}): ` +
         `${err instanceof Error ? err.message : String(err)}`,
       );
@@ -1194,7 +1195,7 @@ function _landUploadedFiles(msg: ClientUserMessage): WireFile[] {
   const uploadsRoot = join(_uploadRootDir(), room) + sep;
   for (const file of files) {
     if (!file) {
-      console.error(`[remote-pi] skipped malformed upload id=${msg.id}`);
+      logDiag(`[remote-pi] skipped malformed upload id=${msg.id}`);
       continue;
     }
     // Plan/62: chunked-upload reference — the bytes already arrived over the
@@ -1205,14 +1206,14 @@ function _landUploadedFiles(msg: ClientUserMessage): WireFile[] {
     if (typeof file.path === "string" && file.text === undefined) {
       const resolved = resolve(file.path);
       if (!resolved.startsWith(uploadsRoot) || !existsSync(resolved)) {
-        console.error(`[remote-pi] rejected out-of-dir upload ref id=${msg.id}: ${file.path}`);
+        logDiag(`[remote-pi] rejected out-of-dir upload ref id=${msg.id}: ${file.path}`);
         continue;
       }
       landed.push({ name: _safeUploadName(file.name), path: resolved });
       continue;
     }
     if (typeof file.text !== "string") {
-      console.error(`[remote-pi] skipped malformed upload id=${msg.id}`);
+      logDiag(`[remote-pi] skipped malformed upload id=${msg.id}`);
       continue;
     }
     const name = _safeUploadName(file.name);
@@ -1312,10 +1313,10 @@ function _sessionAcceptsUploadSender(session: UploadSession, sender: PlainPeerCh
   const senderPeerId = _peerIdOfChannel(sender);
   if (senderPeerId !== undefined && senderPeerId === session.ownerPeerId) {
     session.sender = sender;
-    console.error(`[remote-pi] upload ${session.id} adopted the reconnected channel for the same owner`);
+    logDiag(`[remote-pi] upload ${session.id} adopted the reconnected channel for the same owner`);
     return true;
   }
-  console.error(`[remote-pi] upload ${session.id} refused: a different peer tried to continue it (owner=${session.ownerPeerId ?? "?"}, sender=${senderPeerId ?? "?"})`);
+  logDiag(`[remote-pi] upload ${session.id} refused: a different peer tried to continue it (owner=${session.ownerPeerId ?? "?"}, sender=${senderPeerId ?? "?"})`);
   return false;
 }
 
@@ -1330,12 +1331,12 @@ function _failUpload(
   if (session) {
     _uploadSessions.delete(session.id);
     try { unlinkSync(session.partPath); } catch { /* already gone */ }
-    console.error(`[remote-pi] upload ${session.id} cancelled: ${code}`);
+    logDiag(`[remote-pi] upload ${session.id} cancelled: ${code}`);
   } else {
     // No session to name (a malformed/too-large/rejected start, or a frame
     // for a session that no longer exists): still log it — a silent
     // rejection is undiagnosable from the outside.
-    console.error(`[remote-pi] upload refused (${code}) for ${inReplyTo ?? "<no id>"}: ${message}`);
+    logDiag(`[remote-pi] upload refused (${code}) for ${inReplyTo ?? "<no id>"}: ${message}`);
   }
   sender.send({ type: "error", code, in_reply_to: inReplyTo, message });
 }
@@ -1392,7 +1393,7 @@ export function _handleUploadStart(sender: PlainPeerChannel, msg: { id: string; 
     sender,
     ownerPeerId: _peerIdOfChannel(sender),
   });
-  console.error(`[remote-pi] upload ${msg.id} started: ${msg.name} (${msg.size} bytes)`);
+  logDiag(`[remote-pi] upload ${msg.id} started: ${msg.name} (${msg.size} bytes)`);
 }
 
 export function _handleUploadChunk(sender: PlainPeerChannel, msg: { id: string; index: number; data: string }): void {
@@ -1400,7 +1401,7 @@ export function _handleUploadChunk(sender: PlainPeerChannel, msg: { id: string; 
   if (!session) {
     // Answer every time: after a daemon restart (or a TTL reap) the app would
     // otherwise keep streaming the rest of the file into a dead session.
-    console.error(`[remote-pi] upload_chunk for unknown session ${typeof msg.id === "string" ? msg.id : "<malformed>"}`);
+    logDiag(`[remote-pi] upload_chunk for unknown session ${typeof msg.id === "string" ? msg.id : "<malformed>"}`);
     // Distinct code (not invalid_message): the app's session was lost by a
     // relay/transport drop between start and this chunk — a TRANSIENT
     // condition the app must recover by restarting the whole upload, not a
@@ -1439,7 +1440,7 @@ export function _handleUploadChunk(sender: PlainPeerChannel, msg: { id: string; 
   session.bytes += decoded.length;
   session.nextIndex += 1;
   session.lastSeenAt = Date.now();
-  console.error(`[remote-pi] upload ${session.id} chunk ${msg.index} ok (${session.bytes}/${session.size} bytes)`);
+  logDiag(`[remote-pi] upload ${session.id} chunk ${msg.index} ok (${session.bytes}/${session.size} bytes)`);
 }
 
 /** Final hash-based idempotency: reuse an existing file of identical content. */
@@ -1475,7 +1476,7 @@ export async function _handleUploadDone(sender: PlainPeerChannel, msg: { id: str
     _failUpload(sender, undefined, _replyId(msg.id), "upload_rejected", "upload_done: not your session");
     return;
   }
-  console.error(`[remote-pi] upload ${session.id} done received (${session.bytes}/${session.size} bytes)`);
+  logDiag(`[remote-pi] upload ${session.id} done received (${session.bytes}/${session.size} bytes)`);
   if (session.bytes !== session.size) {
     _failUpload(sender, session, msg.id, "upload_size_mismatch", `Received ${session.bytes} of ${session.size} bytes`);
     return;
@@ -1502,7 +1503,7 @@ export async function _handleUploadDone(sender: PlainPeerChannel, msg: { id: str
     renameSync(session.partPath, finalPath);
     try { chmodSync(finalPath, 0o600); } catch { /* best effort */ }
   } catch (error) {
-    console.error(`[remote-pi] upload ${msg.id} failed at rename: ${error instanceof Error ? error.message : String(error)}`);
+    logDiag(`[remote-pi] upload ${msg.id} failed at rename: ${error instanceof Error ? error.message : String(error)}`);
     try { unlinkSync(session.partPath); } catch { /* best effort */ }
     sender.send({
       type: "error",
@@ -1512,7 +1513,7 @@ export async function _handleUploadDone(sender: PlainPeerChannel, msg: { id: str
     });
     return;
   }
-  console.error(`[remote-pi] upload ${msg.id} landed at ${finalPath}`);
+  logDiag(`[remote-pi] upload ${msg.id} landed at ${finalPath}`);
   sender.send({ type: "upload_complete", in_reply_to: msg.id, id: msg.id, name: session.name, path: finalPath });
 }
 
@@ -1605,7 +1606,7 @@ async function _deliverImageUserMessage(
       await _emitReceivedImagePreviews(msg, previewDelivery);
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
-      console.error(`[remote-pi] failed emitting image preview id=${msg.id}: ${detail}`);
+      logDiag(`[remote-pi] failed emitting image preview id=${msg.id}: ${detail}`);
     }
   };
   if (previewDelivery === "immediate") {
@@ -2385,11 +2386,11 @@ export function _seedMessageBufferFromSession(ctx: unknown): void {
     }
     if (seeded.length === 0) return;
     _messageBuffer = seeded as typeof _messageBuffer;
-    process.stderr.write(
+    logDiag(
       `[remote-pi] history seeded from session: ${seeded.length} messages\n`,
     );
   } catch (err) {
-    process.stderr.write(`[remote-pi] history seed failed: ${String(err)}\n`);
+    logDiag(`[remote-pi] history seed failed: ${String(err)}\n`);
   }
 }
 
@@ -2563,7 +2564,7 @@ function _runtimeOwnerFingerprint(runtimeKey: string): string {
 function _inspectPeerRecord(record: unknown): InspectedPeerRecord | null {
   if (!record || typeof record !== "object") {
     const fingerprint = _rawOwnerFingerprint(record);
-    console.warn(`[remote-pi] event=invalid_owner_record owner_fp=${fingerprint}`);
+    logDiag(`[remote-pi] event=invalid_owner_record owner_fp=${fingerprint}`);
     return null;
   }
 
@@ -2571,7 +2572,7 @@ function _inspectPeerRecord(record: unknown): InspectedPeerRecord | null {
   const rawHandle = candidate.remote_epk;
   if (typeof rawHandle !== "string") {
     const fingerprint = _rawOwnerFingerprint(rawHandle);
-    console.warn(`[remote-pi] event=invalid_owner_record owner_fp=${fingerprint}`);
+    logDiag(`[remote-pi] event=invalid_owner_record owner_fp=${fingerprint}`);
     return null;
   }
 
@@ -2588,7 +2589,7 @@ function _inspectPeerRecord(record: unknown): InspectedPeerRecord | null {
     return { record: safeRecord, rawHandle, runtimeKey };
   } catch {
     const fingerprint = _rawOwnerFingerprint(rawHandle);
-    console.warn(`[remote-pi] event=invalid_owner_record owner_fp=${fingerprint}`);
+    logDiag(`[remote-pi] event=invalid_owner_record owner_fp=${fingerprint}`);
     return { record: safeRecord, rawHandle, runtimeKey: null };
   }
 }
@@ -2718,7 +2719,7 @@ function _onRelayClose(closedRelay: RelayClient): void {
   if (_relay !== closedRelay) return; // delayed close from a replaced Relay
   if (_state === "idle") return;  // already torn down (e.g. /remote-pi stop)
 
-  console.error(`[remote-pi] relay WS closed unexpectedly (state=${_state}) — scheduling reconnect`);
+  logDiag(`[remote-pi] relay WS closed unexpectedly (state=${_state}) — scheduling reconnect`);
 
   _relayLifecycleGeneration += 1;
   _stopAutoListener?.();
@@ -2742,7 +2743,7 @@ function _onRelayClose(closedRelay: RelayClient): void {
   }
   _uploadSessions.clear();
   if (reapedUploads > 0) {
-    console.error(`[remote-pi] relay close reaped ${reapedUploads} in-flight upload session(s)`);
+    logDiag(`[remote-pi] relay close reaped ${reapedUploads} in-flight upload session(s)`);
   }
   _peerShort = "";
   _currentTurnId = null;
@@ -2836,7 +2837,7 @@ async function _attemptReconnect(
 
   _relay = relay;
   _reconnectAttempt = 0;
-  console.error(`[remote-pi] relay WS reconnected`);
+  logDiag(`[remote-pi] relay WS reconnected`);
 
   relay.on("close", () => _onRelayClose(relay));
   _stopAutoListener = _installAutoListener(relay);
@@ -2913,7 +2914,7 @@ function _controlCtx(): Pick<ExtensionContext, "ui" | "cwd"> {
 function _headlessUi(): { notify: (msg: string, type?: "info" | "warning" | "error") => void } {
   return {
     notify: (msg: string, type?: "info" | "warning" | "error") => {
-      if (type === "warning" || type === "error") process.stderr.write(`${msg}\n`);
+      if (type === "warning" || type === "error") logDiag(`${msg}\n`);
     },
   };
 }
@@ -3377,7 +3378,7 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
     // echoing the text here renders a second copy of the notification right
     // above the editor — only log when stderr goes to a real log (daemon/
     // supervisor journal), not to a TTY.
-    if (process.stderr.isTTY !== true) console.error(`[remote-pi] notify → app: ${text.slice(0, 120)}`);
+    logDiag(`[remote-pi] notify → app: ${text.slice(0, 120)}`);
   });
 
   // Plano 19: ensure ~/.pi/remote/{sessions,skills}/ exist and deploy the
@@ -3828,7 +3829,7 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
     if (!_extensionUiBridge) {
       _extensionUiBridge = createExtensionUiBridge(pi, _broadcastToActive);
       _uiNotifyCapture = _createUiNotifyCapture(pi, _broadcastToActive, (text) => {
-        if (process.stderr.isTTY !== true) console.error(`[remote-pi] notify → app: ${text.slice(0, 120)}`);
+        logDiag(`[remote-pi] notify → app: ${text.slice(0, 120)}`);
       });
     }
     // Plan/63 — same re-arm rule for the todo mirror, plus a rescan: the branch
@@ -4270,7 +4271,7 @@ async function _cmdRootInner(
                 return;
               } catch {
                 if (attempt === 3) {
-                  process.stderr.write(
+                  logDiag(
                     `[remote-pi] rekey_ephemeral failed (pid=${process.pid} name=${candidate}) — room_delete may miss this room\n`,
                   );
                 } else {
@@ -5676,7 +5677,7 @@ function _wakeAgent(
 ): WakeAgentResult {
   if (!_pi) {
     const detail = "agent session not bound yet";
-    console.error(`[remote-pi] ${label}: ${detail} — message dropped`);
+    logDiag(`[remote-pi] ${label}: ${detail} — message dropped`);
     return { ok: false, detail };
   }
   try {
@@ -5687,7 +5688,7 @@ function _wakeAgent(
     return { ok: true };
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
-    console.error(`[remote-pi] ${label}: agent rejected incoming message: ${detail}`);
+    logDiag(`[remote-pi] ${label}: agent rejected incoming message: ${detail}`);
     _safeNotify(`[remote-pi] failed to process incoming message: ${detail}`, "error");
     return { ok: false, detail };
   }
@@ -5749,7 +5750,7 @@ function _scheduleMeshMessageDrain(): void {
       _agentRunActive = false;
       _pendingMeshMessages = [...batch.slice(delivered), ..._pendingMeshMessages];
       const detail = err instanceof Error ? err.message : String(err);
-      console.error(`[remote-pi] queued mesh delivery failed: ${detail}`);
+      logDiag(`[remote-pi] queued mesh delivery failed: ${detail}`);
       _safeNotify(`[remote-pi] failed to process queued mesh messages: ${detail}`, "error");
     }
   });
@@ -5769,7 +5770,7 @@ function _deliverMeshMessageToAgent(env: MeshEnvelope): void {
   _broadcastToActive({ type: "tool_result", tool_call_id: toolCallId, result: { from: env.from, message: bodyText } });
 
   if (!_pi) {
-    console.error(`[remote-pi] agent-network message from "${env.from}": agent session not bound yet — message dropped`);
+    logDiag(`[remote-pi] agent-network message from "${env.from}": agent session not bound yet — message dropped`);
     return;
   }
   _pendingMeshMessages.push(env);
@@ -6076,7 +6077,7 @@ export function _routeClientMessageFrom(
   }
   if (msg.type === "upload_done") {
     void _handleUploadDone(sender, msg).catch((error) => {
-      console.error(`[remote-pi] upload_done handler failed id=${msg.id}: ${error instanceof Error ? error.message : String(error)}`);
+      logDiag(`[remote-pi] upload_done handler failed id=${msg.id}: ${error instanceof Error ? error.message : String(error)}`);
     });
     return;
   }
@@ -6120,7 +6121,7 @@ export function _routeClientMessageFrom(
         landedFiles = _landUploadedFiles(msg);
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
-        console.error(`[remote-pi] failed landing uploaded file id=${msg.id}: ${detail}`);
+        logDiag(`[remote-pi] failed landing uploaded file id=${msg.id}: ${detail}`);
         sender.send({
           type: "error",
           code: "internal_error",
@@ -6138,7 +6139,7 @@ export function _routeClientMessageFrom(
       if (msg.images && msg.images.length > 0) {
         void _deliverImageUserMessage(sender, msg, shouldSteer, landedFiles).catch((error) => {
           const detail = error instanceof Error ? error.message : String(error);
-          console.error(`[remote-pi] failed delivering image message id=${msg.id}: ${detail}`);
+          logDiag(`[remote-pi] failed delivering image message id=${msg.id}: ${detail}`);
         });
         break;
       }
@@ -6236,7 +6237,7 @@ export function _routeClientMessageFrom(
       // out). Say so in the journal instead.
       const type = (msg as { type?: unknown }).type;
       if (typeof type === "string" && type !== "approve_tool") {
-        console.error(`[remote-pi] ignoring unsupported client message: ${type}`);
+        logDiag(`[remote-pi] ignoring unsupported client message: ${type}`);
       }
       break;
     }
@@ -6310,7 +6311,7 @@ async function _handleRoomCreate(
       mkdirSync(normalized, { recursive: true });
     }
     const name = msg.name?.trim() || undefined;
-    process.stderr.write(
+    logDiag(
       `[remote-pi] room_create path=${normalized} name=${name ?? "<default>"} raw=${msg.path}\n`,
     );
     await callSupervisor({ op: "spawn", cwd: normalized, ...(name ? { name } : {}) });
@@ -6856,7 +6857,7 @@ async function _handleCommandInvoke(
   // trace at all — the journal only had generic frame logs, which is why "no
   // reaction on the phone" was hard to pin down.
   const trace = (outcome: string) =>
-    console.error(`[remote-pi] command_invoke ${msg.text.trim().split(/\s/)[0]} → ${outcome}`);
+    logDiag(`[remote-pi] command_invoke ${msg.text.trim().split(/\s/)[0]} → ${outcome}`);
 
   const builtin = BUILTIN_COMMANDS.find((c) => c.name === parsed.name.toLowerCase());
   if (builtin && builtin.scope === "tui") {
@@ -7016,7 +7017,7 @@ function _handleSessionSync(
     // the app's cursor pointing into the middle of it. Fall back to a full
     // replay, which the app applies as a wholesale substitute.
     if (bytes <= _getSyncMaxBytes()) {
-      process.stderr.write(
+      logDiag(
         `[remote-pi] session_history: delta ${delta.length} events, ` +
         `${Math.round(bytes / 1024)} KB (resumed at ${resumeAt + 1}/${allEvents.length})\n`,
       );
@@ -7033,7 +7034,7 @@ function _handleSessionSync(
       _sendSyncTail(sender);
       return;
     }
-    process.stderr.write(
+    logDiag(
       `[remote-pi] session_history: delta too large (${Math.round(bytes / 1024)} KB), ` +
       `falling back to a full replay\n`,
     );
@@ -7054,7 +7055,7 @@ function _handleSessionSync(
     allEvents.length > effectiveLimit || events.length !== slice.length;
   // LOCAL PATCH (fenlyin): one line of ops evidence for "why did the room lose
   // history" — the reply size and whether anything was dropped.
-  process.stderr.write(
+  logDiag(
     `[remote-pi] session_history: ${events.length}/${allEvents.length} events, ` +
     `${Math.round(bytes / 1024)} KB, truncated=${truncated}` +
     `${msg.since ? ` (cursor not found: ${msg.since.slice(0, 24)})` : ""}\n`,
@@ -7204,7 +7205,7 @@ function _broadcastSessionHistoryReplay(): void {
     events = events.slice(Math.max(1, Math.floor(events.length / 8)));
     bytes = _jsonBytes(events);
   }
-  process.stderr.write(
+  logDiag(
     `[remote-pi] session replaced: replaying ${events.length}/${allEvents.length} history events\n`,
   );
   _broadcastToActive({

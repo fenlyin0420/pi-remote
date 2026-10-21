@@ -990,7 +990,11 @@ describe("command_invoke — feedback", () => {
   });
 
   test("every command path is traced to stderr", async () => {
-    const spy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    // `logDiag` stays quiet on a terminal (it would corrupt the Pi TUI), so the
+    // trace is only observable on a piped stderr — force that here.
+    const priorIsTTY = Object.getOwnPropertyDescriptor(process.stderr, "isTTY");
+    Object.defineProperty(process.stderr, "isTTY", { value: false, configurable: true });
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     try {
       _setPiForTest(makePi());
       const sender = makeSender();
@@ -1001,6 +1005,8 @@ describe("command_invoke — feedback", () => {
       );
     } finally {
       spy.mockRestore();
+      if (priorIsTTY) Object.defineProperty(process.stderr, "isTTY", priorIsTTY);
+      else Reflect.deleteProperty(process.stderr, "isTTY");
     }
   });
 });

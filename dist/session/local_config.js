@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import { logDiag } from "../log.js";
 const LOCAL_DIR = ".pi/remote-pi";
 const LOCAL_FILE = "config.json";
 /**
@@ -136,7 +137,7 @@ export function saveLocalConfig(cwd, patch) {
     }
     catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        console.warn(`[remote-pi] could not persist local config ${p}: ${message}`);
+        logDiag(`[remote-pi] could not persist local config ${p}: ${message}`);
     }
 }
 /**
