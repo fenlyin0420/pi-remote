@@ -94,6 +94,9 @@ type BufferMsg = {
     /** Plan/32: pre-compaction token count, set on the synthetic
      *  `role:"compaction"` marker pushed in `session_compact`. */
     tokensBefore?: number;
+    /** LOCAL (fenlyin): set on a synthetic `role:"toolWrite"` marker — the write
+     *  verdict the Pi's classifier reported for `toolCallId`. */
+    write?: boolean;
     /** LOCAL (fenlyin): model that produced this message. Assistant messages
      *  carry it from the session file / SDK (raw model id, resolved to a
      *  friendly name at map time when `provider` is present). User messages

@@ -3019,6 +3019,75 @@ describe("tool visibility", () => {
     });
   });
 
+  test("tool_write_verdict → tool_write emitted and replayed on re-sync", async () => {
+    await _pairForTest("peer-write");
+    const sendsBefore = relayRef.current!.send.mock.calls.length;
+
+    const onVerdict = captureEventHandler("tool_write_verdict");
+    onVerdict({ type: "tool_write_verdict", toolCallId: "tc_w", write: true, source: "command" });
+
+    const sent = relayRef.current!.send.mock.calls
+      .slice(sendsBefore)
+      .map((c) => c[0] as string)
+      .map(decodeSentCt)
+      .filter((d) => d.inner.type === "tool_write");
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.peer).toBe("peer-write");
+    expect(sent[0]!.inner).toEqual({ type: "tool_write", tool_call_id: "tc_w", write: true });
+
+    // live == re-sync: the marker is buffered and replays as the same event.
+    const replayed = _mapAgentMessagesToEvents(_getMessageBufferForTest() as never).filter(
+      (e) => e.type === "tool_write",
+    );
+    expect(replayed).toContainEqual(
+      expect.objectContaining({ type: "tool_write", tool_call_id: "tc_w", write: true }),
+    );
+  });
+
+  test("a read-only verdict is broadcast but never buffered", async () => {
+    await _pairForTest("peer-read");
+    const onVerdict = captureEventHandler("tool_write_verdict");
+    onVerdict({ type: "tool_write_verdict", toolCallId: "tc_r", write: false, source: "command" });
+
+    const replayed = _mapAgentMessagesToEvents(_getMessageBufferForTest() as never).filter(
+      (e) => e.type === "tool_write" && e.tool_call_id === "tc_r",
+    );
+    expect(replayed).toEqual([]);
+  });
+
+  test("seed: a persisted pi.write-verdict entry replays as tool_write", () => {
+    _resetHistorySeedForTest();
+    _seedMessageBufferFromSession({
+      sessionManager: {
+        getBranch: () => [
+          {
+            type: "message",
+            timestamp: "2026-10-12T10:00:00.000Z",
+            message: {
+              role: "assistant",
+              content: [{ type: "toolCall", id: "tc_p", name: "bash", arguments: { command: "rm -rf build" } }],
+              timestamp: 1,
+            },
+          },
+          {
+            type: "custom",
+            customType: "pi.write-verdict",
+            data: { toolCallId: "tc_p", source: "command" },
+            timestamp: "2026-10-12T10:00:01.000Z",
+          },
+        ],
+      },
+    });
+
+    const replayed = _mapAgentMessagesToEvents(_getMessageBufferForTest() as never).filter(
+      (e) => e.type === "tool_write",
+    );
+    expect(replayed).toContainEqual(
+      expect.objectContaining({ type: "tool_write", tool_call_id: "tc_p", write: true }),
+    );
+    _resetHistorySeedForTest();
+  });
+
   test("tool_execution_start enriches edit args with numbered context hunks", async () => {
     await _pairForTest("peer-edit");
     const cwd = mkdtempSync(join(tmpdir(), "remote-pi-edit-"));

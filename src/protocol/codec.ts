@@ -11,6 +11,7 @@ const SERVER_TYPES = new Set<ServerMessage["type"]>([
   "agent_message",
   "tool_request",
   "tool_result",
+  "tool_write",
   "error",
   "cancelled",
   "pong",

@@ -337,6 +337,11 @@ export type SessionHistoryEvent = {
     diff?: string;
 } | {
     ts: number;
+    type: "tool_write";
+    tool_call_id: string;
+    write: boolean;
+} | {
+    ts: number;
     type: "agent_message";
     in_reply_to: string;
     text: string;
@@ -462,6 +467,10 @@ export type ServerMessage = {
     result?: unknown;
     error?: string;
     diff?: string;
+} | {
+    type: "tool_write";
+    tool_call_id: string;
+    write: boolean;
 } | {
     type: "upload_complete";
     in_reply_to: string;

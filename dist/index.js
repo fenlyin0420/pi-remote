@@ -1551,6 +1551,14 @@ function _refreshFooter(ctx) {
 // Used by session_sync to let the app detect Pi restarts (and force a full
 // replay). Cleared on _goIdle.
 let _sessionStartedAt = null;
+function onToolWriteVerdict(pi, handler) {
+    const on = pi.on;
+    return on.call(pi, "tool_write_verdict", handler);
+}
+/** Custom session entry the Pi writes for a call that writes to its machine
+ *  (`pi.write-verdict`, see the Pi's `write-classifier.ts`). Only write
+ *  verdicts are stored, so an entry's presence is the marker. */
+const WRITE_VERDICT_ENTRY_TYPE = "pi.write-verdict";
 let _messageBuffer = [];
 // LOCAL (fenlyin): wall-clock timing of the reasoning block currently
 // streaming, plus the finished ones of the assistant message being built.
@@ -2072,6 +2080,20 @@ export function _seedMessageBufferFromSession(ctx) {
                     content: typeof entry["summary"] === "string" ? entry["summary"] : "",
                     timestamp: Date.parse(entry["timestamp"] ?? "") || 0,
                     tokensBefore: typeof entry["tokensBefore"] === "number" ? entry["tokensBefore"] : 0,
+                });
+            }
+            else if (entry["type"] === "custom" && entry["customType"] === WRITE_VERDICT_ENTRY_TYPE) {
+                // The Pi persists a verdict only when the call writes, so the entry's
+                // presence is the marker; a restart must not lose it.
+                const data = entry["data"];
+                const toolCallId = data?.toolCallId;
+                if (typeof toolCallId !== "string" || !toolCallId)
+                    continue;
+                seeded.push({
+                    role: "toolWrite",
+                    toolCallId,
+                    write: true,
+                    timestamp: Date.parse(entry["timestamp"] ?? "") || 0,
                 });
             }
             else if (entry["type"] === "custom_message") {
@@ -3165,6 +3187,28 @@ const extension = (pi) => {
             tool_call_id: event.toolCallId,
             tool: event.toolName,
             args: _enrichToolArgs(event.toolName, event.args),
+        });
+    });
+    // Write-operation verdict for a tool call, computed by the Pi (local rules at
+    // call start, a classifier model for the hard cases — so this can arrive
+    // after `tool_execution_end`). The app draws a marker on the card.
+    onToolWriteVerdict(pi, (event) => {
+        // Only writes are worth remembering: the replay of a "not a write" call
+        // carries no marker. Recorded even with no peer attached, because
+        // `session_sync` replays the buffer and a verdict that only existed on the
+        // wire would vanish on reconnect.
+        if (event.write) {
+            _messageBuffer.push({
+                role: "toolWrite",
+                toolCallId: event.toolCallId,
+                write: true,
+                timestamp: Date.now(),
+            });
+        }
+        _broadcastToActive({
+            type: "tool_write",
+            tool_call_id: event.toolCallId,
+            write: event.write,
         });
     });
     pi.on("tool_execution_end", (event, ctx) => {
@@ -7156,6 +7200,16 @@ export function _mapAgentMessagesToEvents(messages, resolveModel = _resolveModel
                     });
                 }
             }
+        }
+        else if (m.role === "toolWrite") {
+            // LOCAL (fenlyin): replayed so a re-sync keeps the write marker. Matched
+            // by id, so its position in the timeline does not matter.
+            events.push({
+                ts,
+                type: "tool_write",
+                tool_call_id: String(m.toolCallId ?? ""),
+                write: m.write === true,
+            });
         }
         else if (m.role === "toolResult") {
             // Same helpers as the live `tool_execution_end` broadcast → live == re-sync.

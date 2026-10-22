@@ -363,6 +363,10 @@ export type SessionHistoryEvent =
       /** The change the tool made, when it reports one (see `tool_result`). */
       diff?: string;
     }
+  // LOCAL (fenlyin): whether the call writes to the Pi's machine. Replayed so a
+  // re-sync keeps the marker, including for calls whose verdict was decided by
+  // the classifier model after the tool had already finished.
+  | { ts: number; type: "tool_write"; tool_call_id: string; write: boolean }
   | {
       ts: number;
       type: "agent_message";
@@ -485,6 +489,11 @@ export type ServerMessage =
       error?: string;
       diff?: string;
     }
+  // LOCAL (fenlyin): write-operation verdict for the card of `tool_call_id`.
+  // It can arrive before `tool_request` (local rules decide at call start) or
+  // after `tool_result` (a model decides after the call finished), so the app
+  // applies it by id whenever it lands.
+  | { type: "tool_write"; tool_call_id: string; write: boolean }
   // Plan/62 — confirms a completed chunked upload: where the file landed.
   | { type: "upload_complete"; in_reply_to: string; id: string; name: string; path: string }
   | { type: "error"; in_reply_to?: string; code: ErrorCode; message: string }

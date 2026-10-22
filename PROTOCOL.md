@@ -389,6 +389,26 @@ tool é o que de fato aconteceu e sobrevive a um re-sync. Sem `details.diff`
 (qualquer outra tool) o campo simplesmente não vai — o shape antigo fica
 idêntico.
 
+### Marca de escrita (`tool_write`)
+
+O Pi classifica cada chamada de tool como escrita ou leitura e publica o veredito
+num evento próprio (`tool_write`), aditivo — clientes antigos ignoram):
+
+```jsonc
+{ "type": "tool_write", "tool_call_id": "tc-1", "write": true }
+```
+
+Por que um evento separado em vez de um campo em `tool_request`: as regras
+locais decidem no início da chamada (o veredito chega **antes** de
+`tool_request`), mas o classificador — um modelo pequeno — decide chamadas
+difíceis (`bash` com heredoc, script, comando desconhecido) e responde
+**depois** de `tool_result`. O app aplica pelo `tool_call_id` em qualquer ordem.
+Só `write: true` é memorizado: o veredito vira um marcador
+`role:"toolWrite"` em `_messageBuffer` e é replayado em `session_history`
+como `{ "type": "tool_write", "tool_call_id", "write" }`; o Pi também persiste
+o veredito no arquivo da sessão (entrada custom `pi.write-verdict`), então um
+restart do daemon re-semeia o marcador em vez de perdê-lo.
+
 ### Side-effects
 
 Os replies (`action_ok` / `models_list`) só confirmam dispatch. Efeitos visíveis chegam pelos canais normais:
