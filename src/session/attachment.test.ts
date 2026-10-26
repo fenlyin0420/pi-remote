@@ -7,7 +7,7 @@
  * every refusal comes back typed so the tool can tell the model what happened.
  */
 import { describe, expect, test, vi, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync, mkdirSync, openSync, closeSync, ftruncateSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -27,6 +27,7 @@ const {
   _encodeAttachment,
   _encodeInlineImage,
   _imageBlocksFromToolResult,
+  _probeChunkedAttachment,
   _pruneInlineImageStore,
   _setInlineImageDirForTest,
   _sniffImageMime,
@@ -291,10 +292,17 @@ describe("images a tool returned inline", () => {
 });
 
 describe("send_to_phone tool", () => {
-  function harness() {
+  function harness(
+    chunked: (req: { id: string; path: string; name: string; mime: string; size: number; note?: string }) => Promise<unknown> = async () => ({
+      ok: true,
+      chunks: 2,
+      bytes: 4,
+    }),
+  ) {
     const tools: Array<{ name: string; execute: (id: string, params: unknown) => Promise<unknown> }> = [];
     const broadcast: unknown[] = [];
     const remembered: unknown[] = [];
+    const streamed: Array<{ id: string; path: string; name: string; mime: string; size: number; note?: string }> = [];
     const pi = {
       registerTool: (t: { name: string; execute: (id: string, params: unknown) => Promise<unknown> }) => {
         tools.push(t);
@@ -304,8 +312,12 @@ describe("send_to_phone tool", () => {
     registerSendToPhoneTool(pi, {
       broadcast: (offer) => broadcast.push(offer),
       remember: (meta) => remembered.push(meta),
+      sendChunked: (req) => {
+        streamed.push(req);
+        return chunked(req) as ReturnType<typeof chunked> as never;
+      },
     });
-    return { tool: tools[0], broadcast, remembered };
+    return { tool: tools[0], broadcast, remembered, streamed };
   }
 
   test("broadcasts the offer, remembers it, and tells the model what happened", async () => {
@@ -346,6 +358,117 @@ describe("send_to_phone tool", () => {
     expect(res.details.ok).toBe(false);
     expect(res.content[0].text).toContain("No such file");
   });
+
+  test("a binary file rides the chunked path and lands the same card", async () => {
+    const { tool, broadcast, remembered, streamed } = harness();
+    const path = write("report.pdf", Buffer.from("%PDF-1.7\n" + "x".repeat(200)));
+    const res = (await tool.execute("tc-10", { path, note: "quarterly  " })) as {
+      content: { text: string }[];
+      details: { ok: boolean; id: string; mime: string };
+    };
+    expect(streamed).toHaveLength(1);
+    expect(streamed[0]).toMatchObject({
+      id: "att_tc-10",
+      path,
+      name: "report.pdf",
+      mime: "application/pdf",
+      note: "quarterly",
+    });
+    // No single-frame offer: the stream IS the delivery.
+    expect(broadcast).toHaveLength(0);
+    expect(remembered).toEqual([
+      expect.objectContaining({ id: "att_tc-10", mime: "application/pdf", path }),
+    ]);
+    expect(res.details.ok).toBe(true);
+    expect(res.content[0].text).toBe(
+      "Sent report.pdf (application/pdf, 209 bytes) to the phone. Streamed in 2 chunks.",
+    );
+  });
+
+  test("text over its inline ceiling is streamed as text, not refused", async () => {
+    const { tool, streamed } = harness();
+    const path = write("dump.md", "a".repeat(ATTACHMENT_TEXT_MAX_BYTES + 32));
+    const res = (await tool.execute("tc-11", { path })) as { details: { ok: boolean } };
+    expect(res.details.ok).toBe(true);
+    expect(streamed[0].mime).toBe("text/markdown");
+  });
+
+  test("a stream that fails reports the phone's reason and remembers nothing", async () => {
+    const { tool, remembered } = harness(async () => ({
+      ok: false,
+      code: "timeout",
+      message: "The phone stopped acknowledging report.pdf after 2097152 of 4194304 bytes.",
+    }));
+    const path = write("report.zip", Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x00]));
+    const res = (await tool.execute("tc-12", { path })) as {
+      content: { text: string }[];
+      details: { ok: boolean; error?: string };
+    };
+    expect(res.details.ok).toBe(false);
+    expect(res.content[0].text).toContain("stopped acknowledging");
+    expect(remembered).toHaveLength(0);
+  });
+
+  test("without a chunked sender the refusal is honest instead of silent", async () => {
+    // The daemon wiring lands separately; until it does, a binary file must say
+    // so rather than fail in the middle of a stream.
+    const tools: Array<{ name: string; execute: (id: string, params: unknown) => Promise<unknown> }> = [];
+    registerSendToPhoneTool(
+      { registerTool: (t: { name: string; execute: (id: string, params: unknown) => Promise<unknown> }) => { tools.push(t); return undefined; } } as unknown as ExtensionAPI,
+      { broadcast: () => {}, remember: () => {} },
+    );
+    const path = write("no-streamer.zip", Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x00]));
+    const res = (await tools[0].execute("tc-14", { path })) as {
+      content: { text: string }[];
+      details: { ok: boolean };
+    };
+    expect(res.details.ok).toBe(false);
+    expect(res.content[0].text).toContain("cannot stream files yet");
+  });
+
+  test("a file over the channel ceiling is refused before any bytes move", async () => {
+    const { tool, streamed, remembered } = harness();
+    const path = join(dir, "huge.iso");
+    const fd = openSync(path, "w");
+    ftruncateSync(fd, 250 * 1024 * 1024 + 1);
+    closeSync(fd);
+    const res = (await tool.execute("tc-13", { path })) as { content: { text: string }[] };
+    expect(streamed).toHaveLength(0);
+    expect(remembered).toHaveLength(0);
+    expect(res.content[0].text).toContain("at most 250 MiB");
+  });
+});
+
+describe("_probeChunkedAttachment", () => {
+  test("the mime comes from the bytes first, the name second", () => {
+    // A PDF named like a text file is still a PDF.
+    const pdf = write("lies.txt", Buffer.from("%PDF-1.7\n..."));
+    expect(_probeChunkedAttachment(pdf)).toMatchObject({ ok: true, mime: "application/pdf", name: "lies.txt" });
+    // A real PNG is an image whatever the name says.
+    const png = write("picture.bin", Buffer.concat([PNG_MAGIC, Buffer.alloc(32)]));
+    expect(_probeChunkedAttachment(png)).toMatchObject({ ok: true, mime: "image/png" });
+    // Text keeps the name's text type.
+    const md = write("notes.md", "# hi\n");
+    expect(_probeChunkedAttachment(md)).toMatchObject({ ok: true, mime: "text/markdown" });
+    // Unknown binary falls back to the generic type.
+    const bin = write("blob.bin", Buffer.from([0x00, 0x01, 0x02, 0x03]));
+    expect(_probeChunkedAttachment(bin)).toMatchObject({ ok: true, mime: "application/octet-stream" });
+  });
+
+  test("a prefix cut inside a multi-byte character does not turn text into binary", () => {
+    // 700 KB of 3-byte characters, so the ~1 MiB head lands INSIDE a character.
+    const body = Buffer.from("あ".repeat(350_000), "utf8");
+    const path = write("japanese.txt", body);
+    expect(_probeChunkedAttachment(path)).toMatchObject({ ok: true, mime: "text/plain" });
+  });
+
+  test("missing, empty and directory paths fail with a reason", () => {
+    expect(_probeChunkedAttachment(join(dir, "nope.bin"))).toMatchObject({ ok: false });
+    expect(_probeChunkedAttachment(write("empty.bin", ""))).toMatchObject({ ok: false });
+    const sub = join(dir, "sub");
+    mkdirSync(sub);
+    expect(_probeChunkedAttachment(sub)).toMatchObject({ ok: false });
+  });
 });
 
 describe("file_get", () => {
@@ -372,5 +495,38 @@ describe("file_get", () => {
     const sent: ServerMessage[] = [];
     await handleFileGetRequest({ id: "g-3", path: join(dir, "tmp.png") }, (m) => sent.push(m));
     expect(sent[0]).toMatchObject({ type: "error", in_reply_to: "g-3", code: "not_found" });
+  });
+
+  test("a binary card re-pulls over the chunked path with the same card id", async () => {
+    const path = write("report.pdf", Buffer.from("%PDF-1.7\n" + "x".repeat(64)));
+    const sent: ServerMessage[] = [];
+    const streamed: Array<{ id: string; mime: string; size: number }> = [];
+    await handleFileGetRequest(
+      { id: "g-4", path, attachment_id: "att_tc-9" },
+      (m) => sent.push(m),
+      {
+        sendChunked: async (req) => {
+          streamed.push(req);
+          return { ok: true, chunks: 1, bytes: req.size };
+        },
+      },
+    );
+    expect(sent).toHaveLength(0);
+    expect(streamed).toEqual([
+      expect.objectContaining({ id: "att_tc-9", mime: "application/pdf" }),
+    ]);
+  });
+
+  test("a failed chunked re-pull becomes an error frame, not silence", async () => {
+    const path = write("report.pdf", Buffer.from("%PDF-1.7\n"));
+    const sent: ServerMessage[] = [];
+    await handleFileGetRequest(
+      { id: "g-5", path, attachment_id: "att_tc-9" },
+      (m) => sent.push(m),
+      {
+        sendChunked: async () => ({ ok: false, code: "timeout", message: "phone did not answer" }),
+      },
+    );
+    expect(sent[0]).toMatchObject({ type: "error", in_reply_to: "g-5", message: "phone did not answer" });
   });
 });

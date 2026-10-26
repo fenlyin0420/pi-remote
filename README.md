@@ -95,16 +95,18 @@ current turn, and receive any later reply through the inbox/turn flow with
 
 ### 1b) Sending a file to the phone
 
-- `send_to_phone({ path, note? })` — shows a file from this machine in the
+- `send_to_phone({ path, note? })` — puts any file from this machine into the
   phone app as a card in the chat timeline: an image renders inline, a text
-  file shows its name and a preview. One file per call.
+  file shows a name and a preview, anything else is streamed and can be saved
+  to the phone. One file per call, up to 250 MB.
 
 What counts as an image or as text is decided by the **bytes**, never the name
-(PNG/JPEG/GIF/WebP/BMP by signature, then strict UTF-8/UTF-16 without a NUL
-byte). Images over 2 MiB are downscaled automatically to fit the relay's
-envelope; binary files and text over 1 MiB are refused with a message telling
-the model to send a link instead. `note` is a one-line caption shown under the
-card.
+(PNG/JPEG/GIF/WebP/BMP by signature, container signatures such as `%PDF-` or
+`PK`, then strict UTF-8/UTF-16 without a NUL byte). Images over 2 MiB are
+downscaled to fit one relay envelope; everything else — binary files, large
+text, an image that will not shrink — goes out in 2 MiB chunks over the same
+channel, acknowledged one at a time and verified by sha256 on the phone. `note`
+is a one-line caption shown under the card.
 
 The tool deliberately publishes no `tool_request`/`tool_result` to the app —
 the attachment card *is* the app's rendering of the call. A failure still

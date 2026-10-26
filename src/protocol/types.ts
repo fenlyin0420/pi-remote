@@ -205,6 +205,19 @@ export type ClientMessage =
   // the same `id` the history event used, so the app upserts the existing card
   // instead of adding a second one.
   | { type: "file_get"; id: string; path: string; attachment_id?: string }
+  // Pi → App chunked file push (the mirror of `upload_*`, opposite direction).
+  // A file too big or too binary for one 4 MiB envelope is streamed as base64
+  // chunks; the app acknowledges each one (`file_send_ack`, which is also the
+  // backpressure — the Pi sends the next chunk only after the previous ack),
+  // verifies the whole-file sha256 at the end and answers `file_send_complete`.
+  // `file_send_ready` opens the window: an app too old to know these frames
+  // never answers it, and the Pi reports that instead of streaming into a void.
+  | { type: "file_send_ready"; id: string }
+  | { type: "file_send_ack"; id: string; index: number }
+  | { type: "file_send_complete"; id: string }
+  // The app refused (or lost) the transfer: disk full, hash mismatch, a card
+  // id already in flight, transport gone. `message` is shown to the model.
+  | { type: "file_send_abort"; id: string; code: string; message: string }
   | { type: "approve_tool"; id: string; tool_call_id: string; decision: "allow" | "deny" }
   | { type: "cancel"; id: string; target_id: string }
   | { type: "ping"; id: string }
@@ -295,7 +308,8 @@ export interface WireFile {
  * way to see a file that lives on the Pi's disk. `data` is therefore always
  * present (base64 of the bytes) and bounded — see `ATTACHMENT_MAX_BYTES` in
  * `session/attachment.ts`, which is sized so the double-base64 envelope still
- * fits the relay's 4 MiB.
+ * fits the relay's 4 MiB. Files that do not fit ride `file_send_start` /
+ * `file_send_chunk` / `file_send_end` instead.
  */
 export interface WireFileOffer {
   /** Stable identity: `att_<toolCallId>` — same in the live offer, in the
@@ -473,6 +487,24 @@ export type ServerMessage =
   // `attachment` event) and the app re-pulls with `file_get` if it needs the
   // bytes. `in_reply_to` is set when this answers a `file_get`.
   | (WireFileOffer & { type: "file_offer"; in_reply_to?: string })
+  // Pi → App chunked file push: the frames that replace a single `file_offer`
+  // when the file does not fit one envelope (or is binary). Same `id` the card
+  // uses everywhere (`att_<toolCallId>`, or the `attachment_id` of the
+  // `file_get` being answered), so the app upserts one card either way.
+  //   start → chunk ×N → end   (see `session/file_send.ts`)
+  // The app must answer `file_send_ready` before chunk 0, ack every chunk, and
+  // `file_send_complete` only after the bytes are on disk and the hash matches.
+  | {
+      type: "file_send_start";
+      id: string;
+      name: string;
+      path: string;
+      mime: string;
+      size: number;
+      note?: string;
+    }
+  | { type: "file_send_chunk"; id: string; index: number; data: string }
+  | { type: "file_send_end"; id: string; sha256: string }
   | { type: "agent_message"; in_reply_to: string; text: string; usage?: Usage }
   // Plan/32: pushed after a context compaction (live, and replayed on history
   // re-sync). `tokens_before` is the pre-compaction token count.

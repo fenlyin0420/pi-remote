@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { ServerMessage, WireFileOffer } from "../protocol/types.js";
+import { type FileSendResult } from "./file_send.js";
 /** Hard ceiling for the bytes we put on the wire (see the module comment). */
 export declare const ATTACHMENT_MAX_BYTES: number;
 /**
@@ -52,6 +53,21 @@ export declare function _sniffImageMime(bytes: Buffer): string | null;
  * land on the right side of the line without any extension table.
  */
 export declare function _decodeTextStrict(bytes: Buffer): string | null;
+/** Mime for bytes that are neither a supported image nor text. */
+export declare function _binaryMime(path: string): string;
+/**
+ * The mime implied by a binary container signature, or null when the head is
+ * not a container we know. A `PK` head is refined by the name (docx/xlsx/apk/
+ * epub are all ZIPs); everything else reports its own mime.
+ */
+export declare function _sniffBinaryMime(bytes: Buffer, path: string): string | null;
+/**
+ * Whether a large file's bytes look like text. The head is a PREFIX of the
+ * file, so a cut inside a multi-byte character must not turn a UTF-8 document
+ * into "binary": the last few bytes are dropped before the strict decode, and
+ * only a decode that still fails is a real verdict.
+ */
+export declare function _looksLikeText(head: Buffer): boolean;
 /**
  * Read `path` and return what should go on the wire: the metadata plus the
  * base64 payload. Never throws — a missing file, a directory, a binary blob or
@@ -105,7 +121,53 @@ export interface SendToPhoneDeps {
     broadcast: (offer: FileOfferMessage) => void;
     /** Persist the metadata so a later `session_sync` replays the same card. */
     remember: (meta: AttachmentMeta) => void;
+    /**
+     * Deliver a file that does not fit one envelope (binary, or over the inline
+     * caps) by streaming it in chunks. See `session/file_send.ts`.
+     *
+     * Optional so a build whose daemon has not wired the chunked path yet still
+     * type-checks and still refuses cleanly instead of pretending to send.
+     */
+    sendChunked?: (req: {
+        id: string;
+        path: string;
+        name: string;
+        mime: string;
+        size: number;
+        note?: string;
+    }) => Promise<FileSendResult>;
 }
+/** What the streaming path needs to know about a file before it starts. */
+export type ChunkedProbe = {
+    ok: true;
+    path: string;
+    name: string;
+    mime: string;
+    size: number;
+} | {
+    ok: false;
+    message: string;
+};
+/**
+ * Classify a file for the chunked path: resolve the real path, enforce the
+ * ceiling, and decide the mime from the BYTES (image magic → that image type;
+ * otherwise strict-text → the name's text type; otherwise the name's binary
+ * type). Never throws.
+ */
+export declare function _probeChunkedAttachment(rawPath: string): ChunkedProbe;
+export type DeliverToPhoneResult = {
+    ok: boolean;
+    meta?: AttachmentMeta;
+    /** One line for the model (and the TUI): what happened, or why not. */
+    message: string;
+};
+/**
+ * Hand one file to the phone, picking the cheapest route that works: a single
+ * `file_offer` when the bytes fit one envelope (images are downscaled into it),
+ * otherwise the chunked stream. Both routes remember the same metadata, so the
+ * card replays identically either way.
+ */
+export declare function _deliverToPhone(rawPath: string, note: string | undefined, id: string, deps: SendToPhoneDeps): Promise<DeliverToPhoneResult>;
 /**
  * Register `send_to_phone`. Registered tools are active by default (same rule
  * as `agent_send`), so the model can hand a file over without any setup.
@@ -124,9 +186,21 @@ export declare function registerSendToPhoneTool(pi: ExtensionAPI, deps: SendToPh
  * reply upserts the existing bubble instead of adding a second one. A missing
  * or malformed id is not fatal: we mint one from the request id, and the app
  * still gets the content to show.
+ *
+ * Small files answer with one `file_offer`; a file that does not fit (or is
+ * binary) is streamed instead, with the same card id, when `deps.sendChunked`
+ * is wired — the app's receive path is identical for both.
  */
 export declare function handleFileGetRequest(msg: {
     id: string;
     path: string;
     attachment_id?: string;
-}, reply: (m: ServerMessage) => void): Promise<void>;
+}, reply: (m: ServerMessage) => void, deps?: {
+    sendChunked?: (req: {
+        id: string;
+        path: string;
+        name: string;
+        mime: string;
+        size: number;
+    }) => Promise<FileSendResult>;
+}): Promise<void>;

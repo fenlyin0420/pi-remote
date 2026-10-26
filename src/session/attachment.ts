@@ -10,7 +10,8 @@
 // B original bytes → 4/3 B (inner) → 16/9 B (ct) ≈ 1.78 B, and 16/9·B ≤ 4 MiB
 // gives B ≤ ~2.3 MB. We cap at 2 MiB and DOWNSCALE images to fit (the SDK's own
 // `resizeImage`, Photon/WASM — no new dependency); anything that still doesn't
-// fit is refused with a message that says what to do instead.
+// fit rides the chunked path in `session/file_send.ts` instead, which is what
+// makes an arbitrary file (PDF, archive, video, a 40 MB log) deliverable.
 
 import { closeSync, mkdirSync, openSync, readdirSync, readSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, extname, join } from "node:path";
@@ -19,6 +20,7 @@ import { Type } from "typebox";
 import { resizeImage } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { ServerMessage, WireFileOffer } from "../protocol/types.js";
+import { FILE_SEND_MAX_BYTES, type FileSendResult } from "./file_send.js";
 
 /** Hard ceiling for the bytes we put on the wire (see the module comment). */
 export const ATTACHMENT_MAX_BYTES = 2 * 1024 * 1024;
@@ -132,6 +134,115 @@ function _textMime(path: string): string {
   return "text/plain";
 }
 
+/**
+ * Mime for bytes we could not classify as image or text — the chunked path's
+ * counterpart of `_textMime`. A name that says nothing gets the generic
+ * `application/octet-stream`, which the phone only uses as a label.
+ */
+const BINARY_MIME_BY_EXT: Readonly<Record<string, string>> = {
+  ".pdf": "application/pdf",
+  ".zip": "application/zip",
+  ".gz": "application/gzip",
+  ".tar": "application/x-tar",
+  ".xz": "application/x-xz",
+  ".7z": "application/x-7z-compressed",
+  ".rar": "application/vnd.rar",
+  ".doc": "application/msword",
+  ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  ".xls": "application/vnd.ms-excel",
+  ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ".ppt": "application/vnd.ms-powerpoint",
+  ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  ".odt": "application/vnd.oasis.opendocument.text",
+  ".epub": "application/epub+zip",
+  ".apk": "application/vnd.android.package-archive",
+  ".mp3": "audio/mpeg",
+  ".m4a": "audio/mp4",
+  ".wav": "audio/wav",
+  ".ogg": "audio/ogg",
+  ".flac": "audio/flac",
+  ".mp4": "video/mp4",
+  ".webm": "video/webm",
+  ".mov": "video/quicktime",
+  ".mkv": "video/x-matroska",
+  ".sqlite": "application/vnd.sqlite3",
+  ".db": "application/vnd.sqlite3",
+  ".bin": "application/octet-stream",
+};
+
+/** Mime for bytes that are neither a supported image nor text. */
+export function _binaryMime(path: string): string {
+  return BINARY_MIME_BY_EXT[extname(path).toLowerCase()] ?? "application/octet-stream";
+}
+
+/** Mimes whose files are all ZIP containers underneath (the `PK` magic). */
+const ZIP_FAMILY_MIMES: ReadonlySet<string> = new Set([
+  "application/zip",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  "application/vnd.oasis.opendocument.text",
+  "application/vnd.android.package-archive",
+  "application/epub+zip",
+]);
+
+/**
+ * Container magic for formats that START with printable bytes.
+ *
+ * Why this exists: a PDF's first kilobyte is `%PDF-1.7` plus ASCII, and a text
+ * check alone would call it UTF-8 text and hand the phone a "text file" card
+ * with raw PDF source in the preview. The bytes still decide — the container
+ * signature is part of the bytes, not a guess from the name. The NAME only
+ * refines a family (`PK` + `.docx` → the docx mime).
+ */
+const BINARY_MAGIC: ReadonlyArray<{ mime: string; matches: (b: Buffer) => boolean }> = [
+  { mime: "application/pdf", matches: (b) => b.length > 4 && b.subarray(0, 5).toString("latin1") === "%PDF-" },
+  { mime: "application/zip", matches: (b) => b.length > 4 && b[0] === 0x50 && b[1] === 0x4b && (b[2] === 0x03 || b[2] === 0x05 || b[2] === 0x07) },
+  { mime: "application/gzip", matches: (b) => b.length > 2 && b[0] === 0x1f && b[1] === 0x8b },
+  { mime: "application/x-xz", matches: (b) => b.length > 6 && b.subarray(0, 6).toString("latin1") === "\xfd7zXZ\x00" },
+  { mime: "application/x-7z-compressed", matches: (b) => b.length > 6 && b.subarray(0, 6).equals(Buffer.from([0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c])) },
+  { mime: "application/vnd.rar", matches: (b) => b.length > 7 && b.subarray(0, 7).toString("latin1") === "Rar!\x1a\x07\x00" },
+  { mime: "application/vnd.sqlite3", matches: (b) => b.length > 16 && b.subarray(0, 16).toString("latin1") === "SQLite format 3\x00" },
+  { mime: "application/x-elf", matches: (b) => b.length > 4 && b[0] === 0x7f && b.subarray(1, 4).toString("latin1") === "ELF" },
+  { mime: "video/mp4", matches: (b) => b.length > 12 && b.subarray(4, 8).toString("latin1") === "ftyp" },
+  { mime: "application/x-ole-storage", matches: (b) => b.length > 8 && b.subarray(0, 8).equals(Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1])) },
+];
+
+/**
+ * The mime implied by a binary container signature, or null when the head is
+ * not a container we know. A `PK` head is refined by the name (docx/xlsx/apk/
+ * epub are all ZIPs); everything else reports its own mime.
+ */
+export function _sniffBinaryMime(bytes: Buffer, path: string): string | null {
+  for (const { mime, matches } of BINARY_MAGIC) {
+    let hit = false;
+    try {
+      hit = matches(bytes);
+    } catch {
+      // Truncated buffer inside a matcher: not this container.
+    }
+    if (!hit) continue;
+    if (mime !== "application/zip") return mime;
+    const named = _binaryMime(path);
+    return ZIP_FAMILY_MIMES.has(named) ? named : mime;
+  }
+  return null;
+}
+
+/**
+ * Whether a large file's bytes look like text. The head is a PREFIX of the
+ * file, so a cut inside a multi-byte character must not turn a UTF-8 document
+ * into "binary": the last few bytes are dropped before the strict decode, and
+ * only a decode that still fails is a real verdict.
+ */
+export function _looksLikeText(head: Buffer): boolean {
+  if (_decodeTextStrict(head) !== null) return true;
+  for (let trim = 1; trim <= 3 && head.length > trim; trim++) {
+    if (_decodeTextStrict(head.subarray(0, head.length - trim)) !== null) return true;
+  }
+  return false;
+}
+
 // ── encoding ─────────────────────────────────────────────────────────────────
 
 function _fail(code: Extract<AttachmentEncodeResult, { ok: false }>["code"], message: string): AttachmentEncodeResult {
@@ -227,14 +338,16 @@ export async function _encodeAttachment(rawPath: string): Promise<AttachmentEnco
     return _fail(
       "unsupported",
       `${basename(path)} is ${size} bytes and is not an image. The phone channel carries images ` +
-      `and text files up to ${ATTACHMENT_TEXT_MAX_BYTES} bytes; publish it somewhere and send the link.`,
+      `and text files up to ${ATTACHMENT_TEXT_MAX_BYTES} bytes in one frame; larger files ` +
+      `are streamed instead.`,
     );
   }
-  if (_decodeTextStrict(head) === null) {
+  // A container that happens to start with printable bytes (a PDF, a ZIP) is
+  // not text: it would reach the phone as a "text file" card full of source.
+  if (_sniffBinaryMime(head, path) !== null || _decodeTextStrict(head) === null) {
     return _fail(
       "unsupported",
-      `${basename(path)} is binary. The phone channel carries images and text files only — ` +
-      `send a link, or a text export of it.`,
+      `${basename(path)} is binary. The single-frame channel carries images and text files only.`,
     );
   }
   return {
@@ -440,6 +553,21 @@ export interface SendToPhoneDeps {
   broadcast: (offer: FileOfferMessage) => void;
   /** Persist the metadata so a later `session_sync` replays the same card. */
   remember: (meta: AttachmentMeta) => void;
+  /**
+   * Deliver a file that does not fit one envelope (binary, or over the inline
+   * caps) by streaming it in chunks. See `session/file_send.ts`.
+   *
+   * Optional so a build whose daemon has not wired the chunked path yet still
+   * type-checks and still refuses cleanly instead of pretending to send.
+   */
+  sendChunked?: (req: {
+    id: string;
+    path: string;
+    name: string;
+    mime: string;
+    size: number;
+    note?: string;
+  }) => Promise<FileSendResult>;
 }
 
 function _humanSize(bytes: number): string {
@@ -452,6 +580,141 @@ function _sentLine(meta: AttachmentMeta): string {
   const parts = [`Sent ${meta.name} (${meta.mime}, ${_humanSize(meta.size)})`];
   if (meta.resized && meta.original_size) parts.push(`downscaled from ${_humanSize(meta.original_size)}`);
   return `${parts.join(", ")} to the phone.`;
+}
+
+/** Read up to `cap` bytes from the start of `path`. */
+function _readHead(path: string, cap: number): Buffer | null {
+  try {
+    const fd = openSync(path, "r");
+    try {
+      const buffer = Buffer.alloc(cap);
+      const read = readSync(fd, buffer, 0, cap, 0);
+      return buffer.subarray(0, read);
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return null;
+  }
+}
+
+/** What the streaming path needs to know about a file before it starts. */
+export type ChunkedProbe =
+  | { ok: true; path: string; name: string; mime: string; size: number }
+  | { ok: false; message: string };
+
+/**
+ * Classify a file for the chunked path: resolve the real path, enforce the
+ * ceiling, and decide the mime from the BYTES (image magic → that image type;
+ * otherwise strict-text → the name's text type; otherwise the name's binary
+ * type). Never throws.
+ */
+export function _probeChunkedAttachment(rawPath: string): ChunkedProbe {
+  if (typeof rawPath !== "string" || rawPath.trim() === "") {
+    return { ok: false, message: "No path given." };
+  }
+  let path: string;
+  try {
+    path = realpathSync(rawPath.trim());
+  } catch {
+    return { ok: false, message: `No such file: ${rawPath}` };
+  }
+  let size: number;
+  try {
+    const st = statSync(path);
+    if (!st.isFile()) return { ok: false, message: `Not a regular file: ${path}` };
+    size = st.size;
+  } catch (err) {
+    return { ok: false, message: `Cannot stat ${path}: ${err instanceof Error ? err.message : String(err)}` };
+  }
+  if (size === 0) return { ok: false, message: `${basename(path)} is empty.` };
+  if (size > FILE_SEND_MAX_BYTES) {
+    return {
+      ok: false,
+      message:
+        `${basename(path)} is ${_humanSize(size)}; the phone channel carries at most ` +
+        `${Math.floor(FILE_SEND_MAX_BYTES / (1024 * 1024))} MiB. Share a link instead.`,
+    };
+  }
+
+  const head = _readHead(path, Math.min(size, ATTACHMENT_TEXT_MAX_BYTES + 4));
+  if (head === null) return { ok: false, message: `Cannot read ${path}.` };
+  const imageMime = _sniffImageMime(head);
+  const mime = imageMime ?? _sniffBinaryMime(head, path) ??
+    (_looksLikeText(head) ? _textMime(path) : _binaryMime(path));
+  return { ok: true, path, name: basename(path), mime, size };
+}
+
+export type DeliverToPhoneResult = {
+  ok: boolean;
+  meta?: AttachmentMeta;
+  /** One line for the model (and the TUI): what happened, or why not. */
+  message: string;
+};
+
+/**
+ * Hand one file to the phone, picking the cheapest route that works: a single
+ * `file_offer` when the bytes fit one envelope (images are downscaled into it),
+ * otherwise the chunked stream. Both routes remember the same metadata, so the
+ * card replays identically either way.
+ */
+export async function _deliverToPhone(
+  rawPath: string,
+  note: string | undefined,
+  id: string,
+  deps: SendToPhoneDeps,
+): Promise<DeliverToPhoneResult> {
+  const caption = typeof note === "string" && note.trim() ? note.trim() : undefined;
+  const inline = await _encodeAttachment(rawPath);
+  if (inline.ok) {
+    const meta: AttachmentMeta = {
+      ...inline.meta,
+      id,
+      ...(caption ? { note: caption } : {}),
+    };
+    deps.broadcast({ type: "file_offer", ...meta, data: inline.data });
+    deps.remember(meta);
+    return { ok: true, meta, message: _sentLine(meta) };
+  }
+  // `not_found`/`internal_error` are final. `too_large`/`unsupported` mean the
+  // file needs the streaming path — either it exceeds one envelope or it is not
+  // an image/text at all.
+  if (inline.code === "not_found" || inline.code === "internal_error") {
+    return { ok: false, message: inline.message };
+  }
+  if (!deps.sendChunked) {
+    return {
+      ok: false,
+      message:
+        `${inline.message} This build cannot stream files yet, so only images and ` +
+        `text files up to ${Math.floor(ATTACHMENT_TEXT_MAX_BYTES / 1024)} KB can be sent.`,
+    };
+  }
+  const probe = _probeChunkedAttachment(rawPath);
+  if (!probe.ok) return { ok: false, message: probe.message };
+  const streamed = await deps.sendChunked({
+    id,
+    path: probe.path,
+    name: probe.name,
+    mime: probe.mime,
+    size: probe.size,
+    ...(caption ? { note: caption } : {}),
+  });
+  if (!streamed.ok) return { ok: false, message: streamed.message };
+  const meta: AttachmentMeta = {
+    id,
+    name: probe.name,
+    path: probe.path,
+    mime: probe.mime,
+    size: probe.size,
+    ...(caption ? { note: caption } : {}),
+  };
+  deps.remember(meta);
+  return {
+    ok: true,
+    meta,
+    message: `${_sentLine(meta)} Streamed in ${streamed.chunks} chunks.`,
+  };
 }
 
 /**
@@ -478,32 +741,25 @@ export function registerSendToPhoneTool(pi: ExtensionAPI, deps: SendToPhoneDeps)
     label: "Send To Phone",
     description:
       "Show a file from this machine in the phone app: it appears as a card in the chat " +
-      "timeline (an image renders inline, a text file shows its name and a preview). Use it " +
-      "to hand over a screenshot, a chart, a generated report or any other file the user " +
-      "asked to see. One file per call. Images over 2 MB are downscaled automatically; " +
-      "binary files and text over 1 MB are refused — send a link for those.",
+      "timeline. Images render inline and text files show a name plus a preview; anything " +
+      "else (PDF, archive, video, any binary) is streamed in chunks and the card offers " +
+      "saving it to the phone. Use it to hand over a screenshot, a chart, a generated " +
+      "report or any other file the user asked to see. One file per call, up to 250 MB.",
     promptSnippet:
       "send_to_phone({path, note?}): puts a file from this machine into the chat on the phone " +
-      "(image → inline thumbnail, text → name + preview; ≤2 MB images auto-downscaled, ≤1 MB text).",
+      "(image → inline thumbnail, text → preview, any other file streamed and savable; ≤250 MB).",
     parameters: Params,
     execute: async (toolCallId, params) => {
       const { path, note } = params as { path: string; note?: string };
-      const encoded = await _encodeAttachment(path);
-      if (!encoded.ok) {
+      const result = await _deliverToPhone(path, note, `att_${toolCallId}`, deps);
+      if (!result.ok || !result.meta) {
         // `ok: false` is what the model reads; details mirror it for the TUI.
         return {
-          content: [{ type: "text", text: `Could not send the file: ${encoded.message}` }],
-          details: { ok: false, error: encoded.message, id: "", name: "", path: "", mime: "", size: 0 },
+          content: [{ type: "text", text: `Could not send the file: ${result.message}` }],
+          details: { ok: false, error: result.message, id: "", name: "", path: "", mime: "", size: 0 },
         };
       }
-      const meta: AttachmentMeta = {
-        ...encoded.meta,
-        id: `att_${toolCallId}`,
-        ...(note && note.trim() ? { note: note.trim() } : {}),
-      };
-      deps.broadcast({ type: "file_offer", ...meta, data: encoded.data });
-      deps.remember(meta);
-      return { content: [{ type: "text", text: _sentLine(meta) }], details: { ...meta, ok: true } };
+      return { content: [{ type: "text", text: result.message }], details: { ...result.meta, ok: true } };
     },
   });
 }
@@ -519,22 +775,59 @@ const ATTACHMENT_ID_RE = /^att_[A-Za-z0-9_-]{1,64}$/;
  * reply upserts the existing bubble instead of adding a second one. A missing
  * or malformed id is not fatal: we mint one from the request id, and the app
  * still gets the content to show.
+ *
+ * Small files answer with one `file_offer`; a file that does not fit (or is
+ * binary) is streamed instead, with the same card id, when `deps.sendChunked`
+ * is wired — the app's receive path is identical for both.
  */
 export async function handleFileGetRequest(
   msg: { id: string; path: string; attachment_id?: string },
   reply: (m: ServerMessage) => void,
+  deps?: {
+    sendChunked?: (req: {
+      id: string;
+      path: string;
+      name: string;
+      mime: string;
+      size: number;
+    }) => Promise<FileSendResult>;
+  },
 ): Promise<void> {
+  const requested = typeof msg.attachment_id === "string" ? msg.attachment_id : "";
+  const cardId = ATTACHMENT_ID_RE.test(requested) ? requested : `att_get_${msg.id}`;
   const encoded = await _encodeAttachment(msg.path);
-  if (!encoded.ok) {
+  if (encoded.ok) {
+    reply({
+      type: "file_offer",
+      ...encoded.meta,
+      id: cardId,
+      data: encoded.data,
+      in_reply_to: msg.id,
+    });
+    return;
+  }
+  if (encoded.code === "not_found" || encoded.code === "internal_error" || !deps?.sendChunked) {
     reply({ type: "error", in_reply_to: msg.id, code: encoded.code, message: encoded.message });
     return;
   }
-  const requested = typeof msg.attachment_id === "string" ? msg.attachment_id : "";
-  reply({
-    type: "file_offer",
-    ...encoded.meta,
-    id: ATTACHMENT_ID_RE.test(requested) ? requested : `att_get_${msg.id}`,
-    data: encoded.data,
-    in_reply_to: msg.id,
+  const probe = _probeChunkedAttachment(msg.path);
+  if (!probe.ok) {
+    reply({ type: "error", in_reply_to: msg.id, code: "unsupported", message: probe.message });
+    return;
+  }
+  const streamed = await deps.sendChunked({
+    id: cardId,
+    path: probe.path,
+    name: probe.name,
+    mime: probe.mime,
+    size: probe.size,
   });
+  if (!streamed.ok) {
+    reply({
+      type: "error",
+      in_reply_to: msg.id,
+      code: streamed.code === "too_large" ? "too_large" : "internal_error",
+      message: streamed.message,
+    });
+  }
 }
