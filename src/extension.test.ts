@@ -226,6 +226,7 @@ const {
   _mapAgentMessagesToEvents,
   THINKING_EVENT_MAX_CHARS,
   _setMessageBufferForTest,
+  _setLastEventCtxForTest,
   _flushStreamDeltasForTest,
   _resetStreamDeltasForTest,
   _seedMessageBufferFromSession,
@@ -4053,6 +4054,50 @@ describe("session sync", () => {
     });
   });
 
+  test("1.5.31: session_history carries the live model + thinking snapshot", async () => {
+    await _pairForTest("peer-ss-model-snapshot");
+    _setMessageBufferForTest([]);
+    _setSessionStartedAtForTest(1_700_000_000_000);
+    // `ctx.model` is the production shape (getModel is not a ctx member).
+    _setLastEventCtxForTest({
+      model: {
+        id: "qwen3-27b",
+        name: "Qwen3 27B",
+        provider: "vllm",
+        reasoning: true,
+        contextWindow: 131_072,
+        input: ["text", "image"],
+      },
+    });
+    captureEventHandler("thinking_level_select")({
+      type: "thinking_level_select",
+      level: "high",
+      previousLevel: "medium",
+    });
+
+    const sendsBefore = relayRef.current!.send.mock.calls.length;
+    routeClientMessage(
+      { type: "session_sync", id: "req-model" },
+      { abort: () => undefined },
+    );
+
+    const sent = relayRef.current!.send.mock.calls.slice(sendsBefore)
+      .map((c) => c[0] as string).map(decodeSentCt);
+    const history = sent.find((d) => d.inner.type === "session_history")!;
+    // The snapshot is the CURRENT model — history rows only prove what
+    // generated past replies, so the app must not infer the room model.
+    expect(history.inner["model"]).toMatchObject({
+      id: "qwen3-27b",
+      name: "Qwen3 27B",
+      provider: "vllm",
+      reasoning: true,
+      context_window: 131_072,
+      vision: true,
+    });
+    expect(history.inner["thinking"]).toBe("high");
+    _setLastEventCtxForTest(null);
+  });
+
   test("no limit in request → server uses env default (30)", async () => {
     delete process.env["REMOTE_PI_SYNC_LIMIT"];
     await _pairForTest("peer-ss-mirror-1");
@@ -4170,7 +4215,7 @@ describe("session sync", () => {
     expect(h.inner["truncated"]).toBe(false);
   });
 
-  // LOCAL PATCH (fenlyin): the default cap is 10000, not 30 (see the
+  // The default cap is 10000, not 30 (see the
   // SYNC_LIMIT_DEFAULT comment in index.ts — a short mirror silently dropped
   // older conversation on every room re-entry). The cap behaviour is still
   // covered here, driven explicitly through the env override.
@@ -4545,7 +4590,7 @@ describe("session sync", () => {
     });
   });
 
-  // ── Per-message model captions (LOCAL, fenlyin) ───────────────────────────
+  // ── Per-message model captions ──────────────────────────────────────────────
 
   const fakeResolver = (provider: string, modelId: string) =>
     provider === "llama-cpp" && modelId === "Qwen.gguf" ? "Qwen3.8-27B" : `${provider}/${modelId}`;
@@ -4786,6 +4831,51 @@ describe("session sync", () => {
     _routeClientMessageFrom(sender as never, { type: "file_get", id: "g-2", path: join(tmpdir(), "rp-ghost.png") }, { abort: () => false });
     await vi.waitFor(() => expect(sender.send).toHaveBeenCalled());
     expect(sender.send.mock.calls[0]![0]).toMatchObject({ type: "error", in_reply_to: "g-2", code: "not_found" });
+  });
+
+  test("file_get for a binary file streams it, driven by the app's own acks", async () => {
+    const file = join(tmpdir(), `rp-file-send-${Date.now()}.pdf`);
+    const bytes = Buffer.from("%PDF-1.7\n\u0000\u0001\u0002binary body");
+    writeFileSync(file, bytes);
+    try {
+      const { _routeClientMessageFrom } = await import("./index.js");
+      const frames: Array<Record<string, unknown>> = [];
+      // A stand-in phone: every frame it receives is answered exactly like the
+      // app answers it, through the SAME dispatcher the relay feeds.
+      const answer = (msg: Record<string, unknown>) => {
+        const id = msg.id as string;
+        const reply: Record<string, unknown> | null =
+          msg.type === "file_send_start" ? { type: "file_send_ready", id }
+            : msg.type === "file_send_chunk" ? { type: "file_send_ack", id, index: msg.index }
+              : msg.type === "file_send_end" ? { type: "file_send_complete", id }
+                : null;
+        if (!reply) return;
+        setTimeout(() => {
+          _routeClientMessageFrom(sender as never, reply as never, { abort: () => false });
+        }, 0);
+      };
+      const sender = {
+        send: vi.fn((msg: Record<string, unknown>) => {
+          frames.push(msg);
+          answer(msg);
+        }),
+        last: () => undefined,
+      };
+      _routeClientMessageFrom(sender as never, { type: "file_get", id: "g-9", path: file, attachment_id: "att_tc-11" }, { abort: () => false });
+      await vi.waitFor(() => expect(frames.at(-1)?.type).toBe("file_send_end"), { timeout: 5000 });
+      expect(frames[0]).toMatchObject({
+        type: "file_send_start",
+        id: "att_tc-11",
+        name: file.split("/").pop(),
+        mime: "application/pdf",
+        size: bytes.length,
+      });
+      const chunk = frames.find((f) => f.type === "file_send_chunk") as { data: string };
+      expect(Buffer.from(chunk.data, "base64").equals(bytes)).toBe(true);
+      expect(frames.at(-1)?.sha256).toMatch(/^[0-9a-f]{64}$/);
+    } finally {
+      rmSync(file, { force: true });
+    }
   });
 
   // ── Inline tool images (the TUI's inline image, mirrored) ────────────────
@@ -7072,7 +7162,7 @@ describe("model meta", () => {
     expect(capturedOpts[0]!.roomMeta?.cwd).toBe("/tmp/remote-pi-model-test");
   });
 
-  test("hello carries `model` from getModel() when ctx.model is absent (daemon path)", async () => {
+  test("hello carries `model` from ctx.model (daemon path)", async () => {
     const capturedOpts: Array<{ roomMeta?: { model?: string } }> = [];
     _defaultConnectImpl = async (opts?: unknown) => {
       capturedOpts.push(opts as { roomMeta?: { model?: string } });
@@ -7080,13 +7170,13 @@ describe("model meta", () => {
 
     captureHandler("remote-pi");
     // A headless daemon never fires model_select and has no `ctx.model`, but
-    // its session resolved a default model that getModel() exposes — the fix
+    // its session resolved a model that ctx.model exposes — the fix
     // seeds room_meta from there so the app no longer shows "unknown".
     const ctx = {
       ui: { notify: vi.fn() },
       cwd: "/tmp/remote-pi-daemon-model",
       abort: vi.fn(),
-      getModel: () => ({ id: "claude-opus-4-8", name: "claude-opus-4.8" }),
+      model: { id: "claude-opus-4-8", name: "claude-opus-4.8" },
     } as unknown as ReturnType<typeof makeMockCtx>;
     await _connectForTest(ctx);
 
@@ -7118,7 +7208,7 @@ describe("model meta", () => {
   });
 
   test("hello carries `model` from configured default settings (idle daemon path)", async () => {
-    // A headless daemon has no ctx.model/getModel at connect (the SDK resolves
+    // A headless daemon has no ctx.model at connect (the SDK resolves
     // the session model lazily at the first turn). The fix reads the configured
     // default from <cwd>/.pi/settings.json — the model the daemon WILL use.
     const cwd = mkdtempSync(join(tmpdir(), "pi-daemon-cfg-"));
@@ -7136,7 +7226,7 @@ describe("model meta", () => {
       };
 
       captureHandler("remote-pi");
-      await _connectForTest(makeMockCtx(cwd));  // ctx has no model/getModel
+      await _connectForTest(makeMockCtx(cwd));  // ctx has no model
 
       expect(capturedOpts).toHaveLength(1);
       // The test registry won't know "acme-model-zzz" → falls back to the id.
@@ -7217,7 +7307,7 @@ describe("model meta", () => {
     expect(updates[0]!.room_id).toMatch(/^[A-Za-z0-9_-]{12}$/);
   });
 
-  test("1.5.30: turn_start resolves the model from the session file when getModel() is empty", async () => {
+  test("1.5.30: turn_start resolves the model from the session file when ctx.model is empty", async () => {
     captureHandler("remote-pi");
     await _connectForTest(makeMockCtx("/tmp/remote-pi-turn-start-file"));
 
@@ -7241,7 +7331,7 @@ describe("model meta", () => {
         } as never,
       );
 
-      // The headless-daemon case: no live getModel(), the session file's
+      // The headless-daemon case: no live ctx.model, the session file's
       // last model_change is the ground truth and gets published.
       const updates = relayRef.current!.sendControl.mock.calls
         .map((c) => c[0] as { type: string; meta?: { model?: string } })
@@ -7253,7 +7343,7 @@ describe("model meta", () => {
     }
   });
 
-  test("1.5.30: turn_start live getModel() wins over the session-file walk", async () => {
+  test("1.5.30: turn_start live ctx.model wins over the session-file walk", async () => {
     captureHandler("remote-pi");
     await _connectForTest(makeMockCtx("/tmp/remote-pi-turn-start-live"));
 
@@ -7261,7 +7351,7 @@ describe("model meta", () => {
     onTurnStart(
       { type: "turn_start", turnIndex: 0, timestamp: 0 },
       {
-        getModel: () => ({ name: "LiveModel", id: "live-id" }),
+        model: { name: "LiveModel", id: "live-id" },
         sessionManager: {
           getBranch: () => [
             { type: "model_change", provider: "test-provider", modelId: "test-model.gguf" },
@@ -7284,7 +7374,7 @@ describe("model meta", () => {
     captureHandler("remote-pi");
     await _connectForTest({
       ...makeMockCtx("/tmp/remote-pi-pair-model"),
-      getModel: () => ({ name: "TestModel", id: "test-model.gguf" }),
+      model: { name: "TestModel", id: "test-model.gguf" },
     });
 
     relayRef.current!.emit("message", makeInnerLine(APP_PEER_ID, {
@@ -7451,6 +7541,56 @@ describe("model meta", () => {
       vi.useRealTimers();
     }
   });
+
+  test("1.5.31: thinking_set publishes the SDK's clamped read-back", async () => {
+    captureHandler("remote-pi");
+    await _pairForTest("peer-thinking-readback");
+    // The SDK silently clamps xhigh → high on a model that tops out there, and
+    // emits NO `thinking_level_select` when the previous level was already
+    // high. Without the read-back the app keeps painting the optimistic xhigh.
+    _setPiForTest({
+      setModel: async () => true,
+      setThinkingLevel: vi.fn(),
+      getThinkingLevel: () => "high",
+    });
+
+    routeClientMessage(
+      { type: "thinking_set", id: "th-1", level: "xhigh" },
+      { abort: () => undefined },
+    );
+
+    const updates = relayRef.current!.sendControl.mock.calls
+      .map((c) => c[0] as { type: string; meta?: { thinking?: string } })
+      .filter((f) => f.type === "room_meta_update" && f.meta?.thinking !== undefined);
+    expect(updates.at(-1)!.meta?.thinking).toBe("high");
+  });
+
+  test("1.5.31: session replacement republishes the target session's model", async () => {
+    captureHandler("remote-pi");
+    await _connectForTest(makeMockCtx("/tmp/remote-pi-session-replace-model"));
+    _setCurrentModelForTest("OldModel");
+
+    const onSessionStart = captureEventHandler("session_start");
+    onSessionStart(
+      { type: "session_start", previousSessionFile: "/tmp/old-session.jsonl" },
+      {
+        ui: { notify: vi.fn() },
+        cwd: "/tmp/remote-pi-session-replace-model",
+        abort: vi.fn(),
+        compact: vi.fn(),
+        model: { id: "new-model-id", name: "NewModel" },
+        sessionManager: {
+          getSessionFile: () => "/tmp/new-session.jsonl",
+          getBranch: () => [],
+        },
+      } as never,
+    );
+
+    const updates = relayRef.current!.sendControl.mock.calls
+      .map((c) => c[0] as { type: string; meta?: { model?: string } })
+      .filter((f) => f.type === "room_meta_update" && f.meta?.model !== undefined);
+    expect(updates.at(-1)!.meta?.model).toBe("NewModel");
+  });
 });
 
 describe("thinking level default", () => {
@@ -7614,7 +7754,7 @@ describe("Plan/42: context-usage publishing", () => {
       ui: { notify: vi.fn() },
       cwd,
       model: { contextWindow: CONTEXT_LIMIT },
-      getModel: () => ({ contextWindow: CONTEXT_LIMIT }),
+      model: { contextWindow: CONTEXT_LIMIT },
       sessionManager: { getBranch: () => branch, getEntries: () => [] },
       abort: vi.fn(),
     };

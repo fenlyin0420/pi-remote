@@ -365,7 +365,7 @@ export type SessionHistoryEvent =
       tool_call_id: string;
       tool: string;
       args: Record<string, unknown>;
-      /** LOCAL (fenlyin): the model that issued the call (per-row caption). */
+      /** The model that issued the call (per-row caption). */
       model?: string;
     }
   | {
@@ -377,7 +377,7 @@ export type SessionHistoryEvent =
       /** The change the tool made, when it reports one (see `tool_result`). */
       diff?: string;
     }
-  // LOCAL (fenlyin): whether the call writes to the Pi's machine. Replayed so a
+  // Whether the call writes to the Pi's machine. Replayed so a
   // re-sync keeps the marker, including for calls whose verdict was decided by
   // the classifier model after the tool had already finished.
   | { ts: number; type: "tool_write"; tool_call_id: string; write: boolean }
@@ -387,7 +387,7 @@ export type SessionHistoryEvent =
       in_reply_to: string;
       text: string;
       usage?: Usage;
-      /** LOCAL (fenlyin): the model that produced this text (per-row caption). */
+      /** The model that produced this text (per-row caption). */
       model?: string;
     }
   // Model reasoning, replayed so a re-sync keeps the thinking blocks the app
@@ -414,7 +414,7 @@ export type SessionHistoryEvent =
       /** The tool call that produced the image, when a tool's result did —
        *  the app nests such a card inside that tool's row. */
       tool_call_id?: string;
-      /** LOCAL (fenlyin): the model whose turn produced the file. */
+      /** The model whose turn produced the file. */
       model?: string;
     }
   // Plan/32: a context-compaction marker, replayed in history (survives
@@ -521,7 +521,7 @@ export type ServerMessage =
       error?: string;
       diff?: string;
     }
-  // LOCAL (fenlyin): write-operation verdict for the card of `tool_call_id`.
+  // Write-operation verdict for the card of `tool_call_id`.
   // It can arrive before `tool_request` (local rules decide at call start) or
   // after `tool_result` (a model decides after the call finished), so the app
   // applies it by id whenever it lands.
@@ -552,6 +552,13 @@ export type ServerMessage =
        * protocol bump. Absent when there is nothing to resume from.
        */
       cursor?: string;
+      // LOCAL (fenlyin): the model/thinking level the Pi is running RIGHT NOW.
+      // History rows only prove what generated PAST replies, so without this
+      // the app had to guess the room's current model from the last assistant
+      // row — which made a fresh model switch look reverted on every replay.
+      // Additive: an older app ignores it, an older Pi omits it.
+      model?: WireModel;
+      thinking?: ThinkingLevel;
     }
   // Plan/28 — Replies for typed app actions.
   // `action_ok` / `action_error` carry the original `ActionName` so the

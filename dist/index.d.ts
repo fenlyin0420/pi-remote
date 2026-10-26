@@ -94,19 +94,19 @@ type BufferMsg = {
     /** Plan/32: pre-compaction token count, set on the synthetic
      *  `role:"compaction"` marker pushed in `session_compact`. */
     tokensBefore?: number;
-    /** LOCAL (fenlyin): set on a synthetic `role:"toolWrite"` marker — the write
+    /** Set on a synthetic `role:"toolWrite"` marker — the write
      *  verdict the Pi's classifier reported for `toolCallId`. */
     write?: boolean;
-    /** LOCAL (fenlyin): model that produced this message. Assistant messages
+    /** Model that produced this message. Assistant messages
      *  carry it from the session file / SDK (raw model id, resolved to a
      *  friendly name at map time when `provider` is present). User messages
      *  never carry one — the per-row model caption identifies the model that
      *  generated the reply, which is meaningless on your own message. */
     model?: string;
-    /** LOCAL (fenlyin): provider of `model` (raw ids only — marks the value as
+    /** Provider of `model` (raw ids only — marks the value as
      *  un-resolved so the mapper can resolve it against the model registry). */
     provider?: string;
-    /** LOCAL (fenlyin): wall-clock duration of each reasoning block of this
+    /** Wall-clock duration of each reasoning block of this
      *  assistant message, in content order. Measured live from the SDK's
      *  `thinking_start`/`thinking_end` (see the message_update hook) and
      *  attached here so a `session_history` replay can report the same timings
@@ -198,6 +198,9 @@ export declare function _setPiForTest(pi: unknown): void;
 /** Test-only: set the captured command ctx the `session_switch` interactive
  *  leg calls `switchSession` on. */
 export declare function _setLastCtxForTest(ctx: unknown): void;
+/** Test-only: bind the session_start ctx (the live `model` source used by
+ *  `session_history` snapshots and the model read-back helpers). */
+export declare function _setLastEventCtxForTest(ctx: unknown): void;
 /** Test-only: anchor the `is_current` flag on `session_list` + the
  *  session-replacement detection to a known file. */
 export declare function _setLastKnownSessionFileForTest(file: string | null): void;

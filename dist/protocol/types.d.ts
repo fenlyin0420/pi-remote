@@ -171,6 +171,21 @@ export type ClientMessage = {
     path: string;
     attachment_id?: string;
 } | {
+    type: "file_send_ready";
+    id: string;
+} | {
+    type: "file_send_ack";
+    id: string;
+    index: number;
+} | {
+    type: "file_send_complete";
+    id: string;
+} | {
+    type: "file_send_abort";
+    id: string;
+    code: string;
+    message: string;
+} | {
     type: "approve_tool";
     id: string;
     tool_call_id: string;
@@ -276,7 +291,8 @@ export interface WireFile {
  * way to see a file that lives on the Pi's disk. `data` is therefore always
  * present (base64 of the bytes) and bounded — see `ATTACHMENT_MAX_BYTES` in
  * `session/attachment.ts`, which is sized so the double-base64 envelope still
- * fits the relay's 4 MiB.
+ * fits the relay's 4 MiB. Files that do not fit ride `file_send_start` /
+ * `file_send_chunk` / `file_send_end` instead.
  */
 export interface WireFileOffer {
     /** Stable identity: `att_<toolCallId>` — same in the live offer, in the
@@ -325,7 +341,7 @@ export type SessionHistoryEvent = {
     tool_call_id: string;
     tool: string;
     args: Record<string, unknown>;
-    /** LOCAL (fenlyin): the model that issued the call (per-row caption). */
+    /** The model that issued the call (per-row caption). */
     model?: string;
 } | {
     ts: number;
@@ -346,7 +362,7 @@ export type SessionHistoryEvent = {
     in_reply_to: string;
     text: string;
     usage?: Usage;
-    /** LOCAL (fenlyin): the model that produced this text (per-row caption). */
+    /** The model that produced this text (per-row caption). */
     model?: string;
 } | {
     ts: number;
@@ -369,7 +385,7 @@ export type SessionHistoryEvent = {
     /** The tool call that produced the image, when a tool's result did —
      *  the app nests such a card inside that tool's row. */
     tool_call_id?: string;
-    /** LOCAL (fenlyin): the model whose turn produced the file. */
+    /** The model whose turn produced the file. */
     model?: string;
 } | {
     ts: number;
@@ -447,6 +463,23 @@ export type ServerMessage = {
     type: "file_offer";
     in_reply_to?: string;
 }) | {
+    type: "file_send_start";
+    id: string;
+    name: string;
+    path: string;
+    mime: string;
+    size: number;
+    note?: string;
+} | {
+    type: "file_send_chunk";
+    id: string;
+    index: number;
+    data: string;
+} | {
+    type: "file_send_end";
+    id: string;
+    sha256: string;
+} | {
     type: "agent_message";
     in_reply_to: string;
     text: string;
@@ -512,6 +545,8 @@ export type ServerMessage = {
      * protocol bump. Absent when there is nothing to resume from.
      */
     cursor?: string;
+    model?: WireModel;
+    thinking?: ThinkingLevel;
 } | {
     type: "action_ok";
     in_reply_to: string;

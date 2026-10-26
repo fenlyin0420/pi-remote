@@ -54,9 +54,10 @@ import { createTodoBridge } from "./todo_bridge.js";
 import { roomIdFor } from "./rooms.js";
 import { registerAgentTools } from "./session/tools.js";
 import { ATTACHMENT_CUSTOM_TYPE, SEND_TO_PHONE_TOOL, _encodeInlineImage, _imageBlocksFromToolResult, handleFileGetRequest, registerSendToPhoneTool, } from "./session/attachment.js";
+import { FileSendHub, sendFileChunked } from "./session/file_send.js";
 import { formatPeerInventory } from "./session/peer_inventory.js";
 import { MeshNode } from "./session/mesh_node.js";
-import { handleSessionCompact, handleModelSet, handleThinkingSet, handleListModels, reportCompactFailure, } from "./actions/handlers.js";
+import { handleSessionCompact, handleModelSet, handleThinkingSet, handleListModels, reportCompactFailure, wireFromModel, } from "./actions/handlers.js";
 import { ensureModelRegistry } from "./actions/registry.js";
 import { ensureGlobalDirs, LOCAL_SESSION_NAME, sessionAuditPath, sessionSockPath, skillsDir, } from "./session/global_config.js";
 import { acquireCwdLock } from "./session/cwd_lock.js";
@@ -103,6 +104,33 @@ let _relayUrl = null; // URL used by current _relay connection
  */
 const _activePeers = new Map();
 let _peerShort = ""; // shortid of the most recently attached peer (UX hint only)
+/**
+ * Waits for the ack/ready/complete frames of Pi → App chunked file transfers
+ * (`send_to_phone` for a file that does not fit one envelope, and the same for
+ * `file_get`). One transfer per card id; see `session/file_send.ts`.
+ */
+const _fileSendHub = new FileSendHub();
+/** The device a chunked transfer goes to: transfers are point-to-point (they
+ *  need per-chunk acks), so a second attached phone does not receive the file.
+ *  The inline `file_offer` path still reaches every owner. */
+function _firstAttachedPeer() {
+    return _activePeers.values().next().value;
+}
+/** Stream one file to `target`, or report why it cannot go. */
+async function _streamFileToPeer(target, req) {
+    if (!target) {
+        return {
+            ok: false,
+            code: "rejected",
+            message: "No phone is attached right now — reconnect the app and try again.",
+        };
+    }
+    return sendFileChunked(req, {
+        hub: _fileSendHub,
+        ownerPeerId: _peerIdOfChannel(target),
+        send: (msg) => target.send(msg),
+    });
+}
 const REMOTE_PI_RECEIVED_IMAGE_TYPE = "remote-pi:received-image";
 const RECEIVED_IMAGE_MAX_BYTES = 10 * 1024 * 1024;
 const IMAGE_PREVIEW_MIME = "image/png";
@@ -227,6 +255,76 @@ function _setCurrentModel(name) {
     if (_relay && _myRoomId) {
         _relay.sendControl({ type: "room_meta_update", room_id: _myRoomId, meta: { model: name } });
     }
+}
+/**
+ * Cache the session's ACTUAL thinking level and fan it out.
+ *
+ * `thinking_level_select` only fires when the effective level CHANGES, so the
+ * app's optimistic display (it shows the level it just asked for) can stick on
+ * a value the SDK silently clamped away: asking for `xhigh` on a model that
+ * tops out at `high` while the session was already `high` produces
+ * effective == previous == high, no event, and the app keeps painting `xhigh`.
+ * Publishing a read-back after every thinking/model mutation closes that gap
+ * without changing what the SDK does.
+ */
+function _publishThinking(level) {
+    if (!level)
+        return;
+    _currentThinking = level;
+    if (_myRoomMeta)
+        _myRoomMeta = { ..._myRoomMeta, thinking: level };
+    if (!_relay || !_myRoomId)
+        return;
+    _relay.sendControl({
+        type: "room_meta_update",
+        room_id: _myRoomId,
+        meta: { thinking: level },
+    });
+}
+/** Read back the level the SDK is actually running (best effort). */
+function _liveThinkingLevel() {
+    try {
+        return _pi?.getThinkingLevel();
+    }
+    catch {
+        return undefined;
+    }
+}
+/**
+ * The session's live model as a wire record, when the ctx exposes one.
+ *
+ * `ctx.model` is the only reliable source (`getModel` is not a ctx member in
+ * production), so every path that needs the provider/id — not just the display
+ * name — must go through here instead of the name-only `_currentModel`.
+ */
+function _liveWireModel() {
+    const ctx = (_lastEventCtx ?? _lastCtx);
+    try {
+        const live = ctx?.model;
+        if (!live)
+            return undefined;
+        return wireFromModel(live);
+    }
+    catch {
+        return undefined;
+    }
+}
+/**
+ * The model/thinking pair a `session_history` reply carries, so a replay can
+ * never be read as "the current model" (history rows are past facts).
+ */
+function _liveModelSnapshot() {
+    const snapshot = {};
+    const model = _liveWireModel();
+    if (model)
+        snapshot.model = model;
+    // Prefer the SDK read-back: the cache can lag a level the SDK applied
+    // itself (e.g. `_resetThinkingToDefault` sets a level without an event when
+    // the value does not change).
+    const thinking = _liveThinkingLevel() ?? _currentThinking;
+    if (thinking)
+        snapshot.thinking = thinking;
+    return snapshot;
 }
 /**
  * True when this process is a supervisor-spawned daemon starting a NEW session:
@@ -367,7 +465,7 @@ function _resolveContextLimit(ctx) {
         return undefined;
     }
 }
-// LOCAL (fenlyin): per-message model captions. Resolve a raw (provider,
+// Per-message model captions. Resolve a raw (provider,
 // model id) pair to the friendly registry name shown under each message
 // (e.g. `Qwen3.8-27B` instead of `Qwen3.8-27B-APEX-I-Mini.gguf`). The host
 // registry (room's models.json, issue #112 path) is consulted first, then a
@@ -1560,7 +1658,7 @@ function onToolWriteVerdict(pi, handler) {
  *  verdicts are stored, so an entry's presence is the marker. */
 const WRITE_VERDICT_ENTRY_TYPE = "pi.write-verdict";
 let _messageBuffer = [];
-// LOCAL (fenlyin): wall-clock timing of the reasoning block currently
+// Wall-clock timing of the reasoning block currently
 // streaming, plus the finished ones of the assistant message being built.
 // Consumed on `message_end` (attached to the buffered copy) and cleared on
 // `agent_end`, so a replayed `session_history` can carry the same durations
@@ -1874,6 +1972,11 @@ export function _setPiForTest(pi) {
 export function _setLastCtxForTest(ctx) {
     _lastCtx = ctx;
 }
+/** Test-only: bind the session_start ctx (the live `model` source used by
+ *  `session_history` snapshots and the model read-back helpers). */
+export function _setLastEventCtxForTest(ctx) {
+    _lastEventCtx = ctx;
+}
 /** Test-only: anchor the `is_current` flag on `session_list` + the
  *  session-replacement detection to a known file. */
 export function _setLastKnownSessionFileForTest(file) {
@@ -1951,7 +2054,7 @@ let _cwdLock = null;
 // registers under this name; the broker confirms it (and may bump it again under
 // a live race). Null until the lock is acquired.
 let _lockedName = null;
-// LOCAL PATCH (fenlyin) — daemon lock-wait retry.
+// Daemon lock-wait retry.
 // A supervised daemon that cannot take its (cwd,name) lock MUST NOT just return:
 // it would stay alive as a zombie (supervisor reports "running", the app shows
 // the room offline forever, and nothing ever retries). The realistic cause is a
@@ -1991,12 +2094,12 @@ export function _hasPendingLockWaitForTest() {
 // extension. The value is also clamped against the client-provided `limit`
 // (server is authoritative).
 //
-// LOCAL PATCH (fenlyin): default 30 → 10000. The app has no paging: it
+// Default 30 → 10000. The app has no paging: it
 // substitutes its local cache with this reply, so a short mirror means every
 // room re-entry (session_sync on adopt) silently drops the older conversation.
 // The wire budget below — not this count — is what actually bounds the reply.
 const SYNC_LIMIT_DEFAULT = 10000;
-// LOCAL PATCH (fenlyin): byte budget for one `session_history`. The app applies
+// Byte budget for one `session_history`. The app applies
 // the reply as the whole cache (batching would clobber it: `_applyHistory`
 // reconciles per message), and the relay drops outer envelopes over 4 MiB
 // (`RELAY_MAX_CT_MIB`). Stay clear of both: trim the oldest events instead.
@@ -2025,7 +2128,7 @@ function _jsonBytes(value) {
         return Number.MAX_SAFE_INTEGER;
     }
 }
-// ── LOCAL PATCH (fenlyin): seed the history mirror from the Pi session ────────
+// ── Seed the history mirror from the Pi session ───────────────────────────────
 //
 // `_messageBuffer` only ever held messages observed live by THIS process, so any
 // Pi process replacement (daemon restart, crash, app "New Context") made every
@@ -2054,7 +2157,7 @@ export function _seedMessageBufferFromSession(ctx) {
         if (!Array.isArray(entries))
             return;
         const seeded = [];
-        // LOCAL (fenlyin): user messages carry NO model — the model caption is
+        // User messages carry NO model — the model caption is
         // only meaningful for the reply that was generated (assistant rows);
         // assistant messages carry their own model in the file. The `model_change`
         // entries used to tag user rows with the model active when sent — the
@@ -2752,10 +2855,8 @@ function _attachOwner(relay, appPeerId, peerName, firstInner) {
     const channel = new PlainPeerChannel(relay, appPeerId, _myRoomId ?? undefined, (msg) => _routeClientMessageFrom(channel, msg, _liveCtx() ?? _noopCtx), () => _onPeerDisconnect(appPeerId));
     _attachPeerChannel(appPeerId, channel);
     _refreshFooter();
-    // LOCAL PATCH (fenlyin): no user-visible popup for owner attach — the
-    // presence banner in the TUI footer (_refreshFooter) is the only signal.
-    // Upstream shows an info notification each time the app (re)connects,
-    // which pings every new session.
+    // No user-visible popup for owner attach — the presence banner in the TUI
+    // footer (_refreshFooter) is the only signal.
     void peerShort;
     void peerName;
     if (firstInner) {
@@ -3054,6 +3155,7 @@ const extension = (pi) => {
     registerSendToPhoneTool(pi, {
         broadcast: (offer) => _broadcastToActive(offer),
         remember: (meta) => _rememberAttachmentForHistory(meta),
+        sendChunked: (req) => _streamFileToPeer(_firstAttachedPeer(), req),
     });
     _registerReceivedImageRenderer(pi);
     // Received-image preview entries are for local TUI display only. Pi's custom
@@ -3119,16 +3221,7 @@ const extension = (pi) => {
         const level = event?.level;
         if (!level)
             return;
-        _currentThinking = level;
-        if (_myRoomMeta)
-            _myRoomMeta = { ..._myRoomMeta, thinking: level };
-        if (!_relay || !_myRoomId)
-            return;
-        _relay.sendControl({
-            type: "room_meta_update",
-            room_id: _myRoomId,
-            meta: { thinking: level },
-        });
+        _publishThinking(level);
     });
     pi.on("agent_start", () => {
         _agentRunActive = true;
@@ -3355,8 +3448,12 @@ const extension = (pi) => {
         // how often I re-pick Qwen"). Publishing unconditionally re-syncs any app
         // whose cached room model drifted; the app dedupes unchanged values.
         try {
-            let name = ctx.getModel?.()?.name ??
-                ctx.getModel?.()?.id;
+            // `ctx.model` is the live SDK model. `getModel` is NOT a member of the
+            // ctx handed to handlers (it lives on the runner's internal action
+            // bundle), so the old `getModel()` read always returned undefined in
+            // production and the "live beats session file" branch was dead code.
+            const liveModel = ctx.model;
+            let name = liveModel?.name ?? liveModel?.id;
             if (!name) {
                 // Fall back to the session file — but ONLY when the live agent state
                 // is empty: when it is set, it wins (the file's last model_change can
@@ -3421,7 +3518,7 @@ const extension = (pi) => {
         // (2) Persist in history: the CompactionEntry never reaches _messageBuffer
         // via message_end (only user/assistant/toolResult), so push a synthetic
         // marker the mapper turns into a `compaction` event — survives session_sync.
-        // LOCAL (fenlyin): the compaction itself carries no model in the session
+        // The compaction itself carries no model in the session
         // file; the model running when it fired is the caption the app wants.
         _messageBuffer.push({
             role: "compaction",
@@ -3474,6 +3571,21 @@ const extension = (pi) => {
             _sessionStartedAt = Date.now();
             _resetQueuedItems({ broadcast: false });
         }
+        if (sessionReplaced) {
+            // The replacement may have restored a session that ran a DIFFERENT model,
+            // and the SDK only emits `model_select` when the resolved model differs
+            // from the one already in agent state — so a replacement is a model
+            // boundary the app must hear about explicitly, next to context /
+            // first_message / history below. `ctx.model` is bound to the NEW session.
+            try {
+                const live = ctx.model;
+                const name = live?.name ?? live?.id;
+                if (name)
+                    _setCurrentModel(name);
+                _publishThinking(_liveThinkingLevel());
+            }
+            catch { /* stale ctx — the next turn_start re-publishes */ }
+        }
         // Plan/42: context is per-session. A session replacement (new / fork /
         // switch / reload) starts from a different — possibly empty — branch, so
         // drop the previous session's cached usage + debounce clock and publish
@@ -3494,7 +3606,7 @@ const extension = (pi) => {
         // title when the target session is empty.
         if (sessionReplaced)
             _publishFirstMessage(ctx);
-        // LOCAL PATCH (fenlyin): prefill the history mirror with the resumed
+        // Prefill the history mirror with the resumed
         // session's conversation so a room keeps its history across restarts.
         _seedMessageBufferFromSession(ctx);
         // Plan/59 — publish the replacement: every owner's room now shows the
@@ -4008,7 +4120,7 @@ async function _cmdRootInner(ctx, rootLifecycleGeneration) {
             if (!_isCurrentRootLifecycle(rootLifecycleGeneration))
                 return;
             if (isDaemon && !isEphemeral) {
-                // LOCAL PATCH (fenlyin): wait + retry instead of becoming a zombie.
+                // Wait + retry instead of becoming a zombie.
                 // Told once per wait episode — the headless ui forwards warnings to
                 // stderr, and a warning every 15s would flood the supervisor journal.
                 if (!_lockWaitLogged) {
@@ -4294,7 +4406,7 @@ async function _cmdStart(ctx) {
             return;
         }
         ctx.ui.notify(`[remote-pi] relay connect failed: ${String(err)} — will keep retrying`, "error");
-        // LOCAL PATCH (fenlyin): an initial connect failure used to be terminal —
+        // An initial connect failure used to be terminal —
         // the relay stayed down until the process was manually restarted
         // (2026-09-22 outage: dead relay for ~18h). Arm the same reconnect state
         // used after a dropped connection so we keep retrying forever.
@@ -5619,7 +5731,19 @@ export function _routeClientMessageFrom(sender, msg, ctx) {
     // Before the pi-binding guard like the other file/command paths: rehydrating a
     // card after a re-sync must work in a room whose Pi session is gone.
     if (msg.type === "file_get") {
-        void handleFileGetRequest(msg, (reply) => sender.send(reply));
+        void handleFileGetRequest(msg, (reply) => sender.send(reply), {
+            sendChunked: (req) => _streamFileToPeer(sender, req),
+        });
+        return;
+    }
+    // Pi → App chunked file push: the app's answers to a transfer in progress.
+    // Nothing else consumes these, and a session-less room can still be mid-
+    // transfer, so they sit before the pi-binding guard too.
+    if (msg.type === "file_send_ready" ||
+        msg.type === "file_send_ack" ||
+        msg.type === "file_send_complete" ||
+        msg.type === "file_send_abort") {
+        _fileSendHub.accept(msg, _peerIdOfChannel(sender));
         return;
     }
     // Plan/62 — chunked binary upload. No live Pi session needed (the bytes
@@ -5765,10 +5889,21 @@ export function _routeClientMessageFrom(sender, msg, ctx) {
             break;
         }
         case "model_set":
-            void handleModelSet(_pi, (_lastEventCtx ?? _lastCtx), ensureModelRegistry((_lastEventCtx ?? _lastCtx)), sender, msg, _persistModelDefault, (model) => _setCurrentModel(model.name ?? model.id));
+            void handleModelSet(_pi, (_lastEventCtx ?? _lastCtx), ensureModelRegistry((_lastEventCtx ?? _lastCtx)), sender, msg, _persistModelDefault, (model) => {
+                _setCurrentModel(model.name ?? model.id);
+                // Switching models clamps the thinking level to the new model's
+                // capability. The SDK only announces that when the clamped value
+                // differs from the previous one, so publish the read-back here too.
+                _publishThinking(_liveThinkingLevel());
+            });
             break;
         case "thinking_set":
             handleThinkingSet(_pi, sender, msg);
+            // Read back what the SDK actually applied: it silently clamps to the
+            // nearest supported level and only emits `thinking_level_select` when the
+            // result differs from the previous level, so the app's optimistic pick
+            // would otherwise survive a no-op clamp forever.
+            _publishThinking(_liveThinkingLevel());
             break;
         case "list_models":
             handleListModels((_lastEventCtx ?? _lastCtx), ensureModelRegistry((_lastEventCtx ?? _lastCtx)), sender, msg);
@@ -6467,6 +6602,7 @@ function _handleSessionSync(sender, msg) {
             eos: true,
             truncated: false,
             mode: "full",
+            ..._liveModelSnapshot(),
         });
         return;
     }
@@ -6504,6 +6640,7 @@ function _handleSessionSync(sender, msg) {
                 truncated: false,
                 mode: "delta",
                 cursor: _eventCursor(allEvents, allEvents.length - 1),
+                ..._liveModelSnapshot(),
             });
             _sendSyncTail(sender);
             return;
@@ -6512,7 +6649,7 @@ function _handleSessionSync(sender, msg) {
             `falling back to a full replay\n`);
     }
     const slice = effectiveLimit > 0 ? allEvents.slice(-effectiveLimit) : [];
-    // LOCAL PATCH (fenlyin): fit the reply to the budget by dropping the OLDEST
+    // Fit the reply to the budget by dropping the OLDEST
     // events (the relay would otherwise reject the whole envelope, and the app
     // cannot be handed this as several messages).
     const budget = _getSyncMaxBytes();
@@ -6523,7 +6660,7 @@ function _handleSessionSync(sender, msg) {
         bytes = _jsonBytes(events);
     }
     const truncated = allEvents.length > effectiveLimit || events.length !== slice.length;
-    // LOCAL PATCH (fenlyin): one line of ops evidence for "why did the room lose
+    // One line of ops evidence for "why did the room lose
     // history" — the reply size and whether anything was dropped.
     logDiag(`[remote-pi] session_history: ${events.length}/${allEvents.length} events, ` +
         `${Math.round(bytes / 1024)} KB, truncated=${truncated}` +
@@ -6540,6 +6677,7 @@ function _handleSessionSync(sender, msg) {
         // can resume after. A truncated replay still gives a usable cursor, so the
         // next sync is a delta even when this one had to drop the oldest events.
         cursor: _eventCursor(allEvents, allEvents.length - 1),
+        ..._liveModelSnapshot(),
     });
     _sendSyncTail(sender);
 }
@@ -6651,6 +6789,7 @@ function _resetSessionForNew(inReplyTo) {
         events: [],
         eos: true,
         truncated: false,
+        ..._liveModelSnapshot(),
     });
 }
 /**
@@ -6678,6 +6817,7 @@ function _broadcastSessionHistoryReplay() {
         events,
         eos: true,
         truncated: events.length !== allEvents.length,
+        ..._liveModelSnapshot(),
     });
 }
 /**
@@ -7061,7 +7201,7 @@ function _attachmentMetaFromMessage(m) {
 export function _mapAgentMessagesToEvents(messages, resolveModel = _resolveModelName) {
     const events = [];
     let lastUserId = null;
-    // LOCAL (fenlyin): per-row model captions. `provider` present → the value
+    // Per-row model captions. `provider` present → the value
     // is a RAW model id (session-file seed / SDK assistant message) and gets
     // resolved against the registry; absent → already a display name (live
     // assistant rows, live compaction marker) and used as-is.
@@ -7202,7 +7342,7 @@ export function _mapAgentMessagesToEvents(messages, resolveModel = _resolveModel
             }
         }
         else if (m.role === "toolWrite") {
-            // LOCAL (fenlyin): replayed so a re-sync keeps the write marker. Matched
+            // Replayed so a re-sync keeps the write marker. Matched
             // by id, so its position in the timeline does not matter.
             events.push({
                 ts,

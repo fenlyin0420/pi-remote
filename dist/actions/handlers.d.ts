@@ -17,7 +17,13 @@
  *                                  resolves with `{cancelled}` flag
  *   - `pi.setModel(model)`       — returns `false` if no auth configured
  *   - `pi.setThinkingLevel(lvl)` — synchronous
- *   - `ctx.getModel()`           — optional, undefined before first turn
+ *   - `ctx.model`                — the session's live model, undefined before
+ *                                  the SDK resolves one. NOT `ctx.getModel()`:
+ *                                  that member only exists on the runner's
+ *                                  internal action bundle (`ExtensionContextActions`),
+ *                                  never on the `ExtensionContext` handed to
+ *                                  handlers, so reading it always yielded
+ *                                  `undefined` in production.
  *   - `ModelRegistry.{refresh,getAvailable,find}` — see `registry.ts`
  */
 import type { ClientMessage, ServerMessage, WireModel } from "../protocol/types.js";
@@ -103,6 +109,14 @@ export interface ActionCtx {
     }) => Promise<{
         cancelled: boolean;
     }>;
+    /**
+     * The session's live model (`ExtensionContext.model`). Read this before
+     * {@link getModel}, which is a runner-internal action that is not part of
+     * the ctx object in production. Optional: undefined before the first turn.
+     */
+    model?: Model<any> | undefined;
+    /** @deprecated Never present on a real ctx — kept only for fakes that still
+     *  pass it. Prefer {@link model}. */
     getModel?: () => Model<any> | undefined;
     /**
      * Live session registry from Pi's extension ctx. Includes providers/models

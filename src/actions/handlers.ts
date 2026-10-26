@@ -17,7 +17,13 @@
  *                                  resolves with `{cancelled}` flag
  *   - `pi.setModel(model)`       — returns `false` if no auth configured
  *   - `pi.setThinkingLevel(lvl)` — synchronous
- *   - `ctx.getModel()`           — optional, undefined before first turn
+ *   - `ctx.model`                — the session's live model, undefined before
+ *                                  the SDK resolves one. NOT `ctx.getModel()`:
+ *                                  that member only exists on the runner's
+ *                                  internal action bundle (`ExtensionContextActions`),
+ *                                  never on the `ExtensionContext` handed to
+ *                                  handlers, so reading it always yielded
+ *                                  `undefined` in production.
  *   - `ModelRegistry.{refresh,getAvailable,find}` — see `registry.ts`
  */
 
@@ -114,6 +120,14 @@ export interface ActionCtx {
   switchSession?: (sessionPath: string, options?: {
     withSession?: (ctx: ActionCtx) => Promise<void>;
   }) => Promise<{ cancelled: boolean }>;
+  /**
+   * The session's live model (`ExtensionContext.model`). Read this before
+   * {@link getModel}, which is a runner-internal action that is not part of
+   * the ctx object in production. Optional: undefined before the first turn.
+   */
+  model?: Model<any> | undefined;
+  /** @deprecated Never present on a real ctx — kept only for fakes that still
+   *  pass it. Prefer {@link model}. */
   getModel?: () => Model<any> | undefined;
   /**
    * Live session registry from Pi's extension ctx. Includes providers/models
@@ -331,7 +345,10 @@ export function handleListModels(
     const liveReg = ctx?.modelRegistry ?? reg;
     liveReg.refresh();
     const models = liveReg.getAvailable().map(wireFromModel);
-    const current = ctx?.getModel?.();
+    // `ctx.model` is the only live source; `getModel` is not a member of the
+    // ctx object (see the ActionCtx doc). Keep it as a last-resort fallback so
+    // existing fakes stay meaningful without masking production behavior.
+    const current = ctx?.model ?? ctx?.getModel?.();
     sender.send({
       type: "models_list",
       in_reply_to: msg.id,
@@ -339,6 +356,10 @@ export function handleListModels(
       current: current ? wireFromModel(current) : undefined,
     });
   } catch (e) {
+    // Keep the generic `error` frame (it carries the real reason), but pair it
+    // to the request via `in_reply_to`: the app's pending-action table fails
+    // fast on any error that names its request instead of waiting out the 15s
+    // timeout.
     sender.send({
       type: "error",
       in_reply_to: msg.id,

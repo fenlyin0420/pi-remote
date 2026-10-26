@@ -311,9 +311,9 @@ describe("handleModelSet", () => {
 // ── list_models ────────────────────────────────────────────────────────────
 
 describe("handleListModels", () => {
-  test("returns wire-shaped catalog with current echo when ctx.getModel is set", () => {
+  test("returns wire-shaped catalog with current echoed from ctx.model", () => {
     const reg = fakeRegistry([sampleModel]);
-    const ctx: ActionCtx = { getModel: () => sampleModel };
+    const ctx: ActionCtx = { model: sampleModel };
     const sender = makeSender();
     handleListModels(ctx, reg, sender, { type: "list_models", id: "r5" });
     const reply = sender.sent[0];
@@ -333,7 +333,7 @@ describe("handleListModels", () => {
     expect(reply.current).toEqual(reply.models[0]);
   });
 
-  test("omits `current` when ctx.getModel is undefined", () => {
+  test("omits `current` when ctx has no model", () => {
     const reg = fakeRegistry([sampleModel]);
     const sender = makeSender();
     handleListModels(null, reg, sender, { type: "list_models", id: "r5" });

@@ -17,7 +17,13 @@
  *                                  resolves with `{cancelled}` flag
  *   - `pi.setModel(model)`       — returns `false` if no auth configured
  *   - `pi.setThinkingLevel(lvl)` — synchronous
- *   - `ctx.getModel()`           — optional, undefined before first turn
+ *   - `ctx.model`                — the session's live model, undefined before
+ *                                  the SDK resolves one. NOT `ctx.getModel()`:
+ *                                  that member only exists on the runner's
+ *                                  internal action bundle (`ExtensionContextActions`),
+ *                                  never on the `ExtensionContext` handed to
+ *                                  handlers, so reading it always yielded
+ *                                  `undefined` in production.
  *   - `ModelRegistry.{refresh,getAvailable,find}` — see `registry.ts`
  */
 /** Project a SDK `Model<Api>` onto the wire schema. Shared by list_models
@@ -163,7 +169,10 @@ export function handleListModels(ctx, reg, sender, msg) {
         const liveReg = ctx?.modelRegistry ?? reg;
         liveReg.refresh();
         const models = liveReg.getAvailable().map(wireFromModel);
-        const current = ctx?.getModel?.();
+        // `ctx.model` is the only live source; `getModel` is not a member of the
+        // ctx object (see the ActionCtx doc). Keep it as a last-resort fallback so
+        // existing fakes stay meaningful without masking production behavior.
+        const current = ctx?.model ?? ctx?.getModel?.();
         sender.send({
             type: "models_list",
             in_reply_to: msg.id,
@@ -172,6 +181,10 @@ export function handleListModels(ctx, reg, sender, msg) {
         });
     }
     catch (e) {
+        // Keep the generic `error` frame (it carries the real reason), but pair it
+        // to the request via `in_reply_to`: the app's pending-action table fails
+        // fast on any error that names its request instead of waiting out the 15s
+        // timeout.
         sender.send({
             type: "error",
             in_reply_to: msg.id,
