@@ -925,7 +925,7 @@ export class Supervisor {
     }
 
     // Crash: schedule restart with backoff.
-    // LOCAL PATCH (fenlyin): never give up. The fixed schedule used to end in
+    // Never give up. The fixed schedule used to end in
     // a permanent `crashed` state (2026-09-22 outage: daemon down ~20h until
     // manual restart). After exhausting the schedule, keep retrying at the
     // final (5-minute) interval forever.

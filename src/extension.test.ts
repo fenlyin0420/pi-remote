@@ -3953,10 +3953,10 @@ describe("rooms wiring", () => {
     expect(_getState()).toBe("idle");
   });
 
-  // LOCAL PATCH (fenlyin): an initial Relay failure is no longer terminal.
-  // Upstream returned to `idle` and waited for a manual restart; that left the
-  // relay dead for ~18h (2026-09-22 outage). The patched path arms the normal
-  // reconnect state instead, so the assertion is `started`.
+  // An initial Relay failure must not be terminal: the old path returned to
+  // `idle` and waited for a manual restart, which left the relay dead for ~18h
+  // (2026-09-22 outage). The current path arms the normal reconnect state
+  // instead, so the assertion is `started`.
   test("generic initial Relay failure closes its candidate before reporting", async () => {
     const failure = new Error("initial Relay failed");
     _defaultConnectImpl = async () => { throw failure; };
