@@ -30,22 +30,15 @@ function tmpCwd(): string {
 
 /** Sequencing helper: returns a UI mock that replays canned answers in order. */
 function makeUI(answers: Array<string | undefined>): WizardUI & {
-  inputCalls: Array<{ title: string; defaultValue?: string }>;
   selectCalls: Array<{ title: string; options: string[] }>;
   notifies: Array<{ msg: string; kind: string }>;
 } {
   const queue = [...answers];
-  const inputCalls: Array<{ title: string; defaultValue?: string }> = [];
   const selectCalls: Array<{ title: string; options: string[] }> = [];
   const notifies: Array<{ msg: string; kind: string }> = [];
   return {
-    inputCalls,
     selectCalls,
     notifies,
-    input: vi.fn().mockImplementation(async (title: string, opts?: { defaultValue?: string }) => {
-      inputCalls.push({ title, defaultValue: opts?.defaultValue });
-      return queue.shift();
-    }),
     select: vi.fn().mockImplementation(async (title: string, options: string[]) => {
       selectCalls.push({ title, options });
       return queue.shift();
@@ -56,23 +49,26 @@ function makeUI(answers: Array<string | undefined>): WizardUI & {
   };
 }
 
-describe("runSetupWizard (2 prompts + confirm)", () => {
+describe("runSetupWizard (relay + confirm, never a name prompt)", () => {
   test("1) accepts answers end-to-end → returns config (no daemon prompt)", async () => {
-    // Sequence: agent name (input), use_relay (Yes), confirm (Yes)
-    const ui = makeUI(["my-agent", YES, YES]);
+    // Sequence: use_relay (Yes), confirm (Yes)
+    const ui = makeUI([YES, YES]);
     const cfg = await runSetupWizard(ui, {
       agent_name: "default-name",
       use_relay: true,
     });
     expect(cfg).toEqual({
-      agent_name: "my-agent",
+      agent_name: "default-name",
       auto_start_relay: true,
     });
   });
 
-  test("2) empty agent_name submission accepts the default", async () => {
-    // Empty input → wizard takes the default ("foo"), then relay Yes, confirm Yes.
-    const ui = makeUI(["", YES, YES]);
+  test("2) the agent name comes from the cwd default — it is never typed", async () => {
+    const ui = makeUI([YES, YES]);
+    // A UI without an `input` method must still complete: the wizard has no
+    // free-text question left. (The pre-fix wizard asked "Agent name:" here,
+    // which is what interrupted every `/new` in a folder without a config.)
+    expect("input" in ui).toBe(false);
     const cfg = await runSetupWizard(ui, {
       agent_name: "foo",
       use_relay: true,
@@ -83,22 +79,19 @@ describe("runSetupWizard (2 prompts + confirm)", () => {
     });
   });
 
-  test("2b) prompt labels surface the default as hint; no daemon prompt", async () => {
-    const ui = makeUI(["my-agent", YES, YES]);
+  test("2b) prompt labels are the relay question + confirm; no daemon prompt", async () => {
+    const ui = makeUI([YES, YES]);
     await runSetupWizard(ui, {
       agent_name: "default-name",
       use_relay: true,
     });
-    expect(ui.inputCalls.map((c) => c.title)).toEqual([
-      "Agent name: (default: default-name)",
-    ]);
     expect(ui.selectCalls.map((c) => c.title)).toEqual([
       "Use the relay on this terminal to connect to the remote mesh (mobile + PCs)?",
       "Save and activate?",
     ]);
   });
 
-  test("3a) cancel on first prompt → returns null", async () => {
+  test("3a) cancel on relay prompt → returns null", async () => {
     const ui = makeUI([undefined]);
     const cfg = await runSetupWizard(ui, {
       agent_name: "foo", use_relay: true,
@@ -106,16 +99,8 @@ describe("runSetupWizard (2 prompts + confirm)", () => {
     expect(cfg).toBeNull();
   });
 
-  test("3b) cancel on relay prompt → returns null", async () => {
-    const ui = makeUI(["agent", undefined]);
-    const cfg = await runSetupWizard(ui, {
-      agent_name: "foo", use_relay: true,
-    });
-    expect(cfg).toBeNull();
-  });
-
   test("3c) cancel on final confirm → returns null (NO chosen)", async () => {
-    const ui = makeUI(["agent", YES, NO]);
+    const ui = makeUI([YES, NO]);
     const cfg = await runSetupWizard(ui, {
       agent_name: "foo", use_relay: true,
     });
@@ -125,18 +110,18 @@ describe("runSetupWizard (2 prompts + confirm)", () => {
   test("4) use_relay=No produces auto_start_relay=false", async () => {
     // When default is false, the picker shows [No, Yes]. We answer with the
     // first ("No") to confirm the off path. Then confirm Yes.
-    const ui = makeUI(["agent", NO, YES]);
+    const ui = makeUI([NO, YES]);
     const cfg = await runSetupWizard(ui, {
       agent_name: "foo", use_relay: false,
     });
     expect(cfg).toEqual({
-      agent_name: "agent",
+      agent_name: "foo",
       auto_start_relay: false,
     });
   });
 
   test("5) relay-prompt informational notify precedes its question", async () => {
-    const ui = makeUI(["agent", YES, YES]);
+    const ui = makeUI([YES, YES]);
     await runSetupWizard(ui, {
       agent_name: "foo", use_relay: true,
     });
@@ -179,19 +164,19 @@ describe("localConfig integration with the wizard", () => {
     const current = loadLocalConfig(cwd);
     expect(current.auto_start_relay).toBe(false);
 
-    const ui = makeUI(["new", YES, YES]);
+    const ui = makeUI([YES, YES]);
     const cfg = await runSetupWizard(ui, {
       agent_name: current.agent_name!,
       use_relay: effectiveAutoStartRelay(current),
     });
     expect(cfg).toEqual({
-      agent_name: "new",
+      agent_name: "old",
       auto_start_relay: true,
     });
-    // The wizard now returns a plain LocalConfig — persist it directly.
+    // The wizard returns a plain LocalConfig — persist it directly.
     saveLocalConfig(cwd, cfg!);
     const updated = loadLocalConfig(cwd);
-    expect(updated.agent_name).toBe("new");
+    expect(updated.agent_name).toBe("old");
     expect(updated.auto_start_relay).toBe(true);
   });
 

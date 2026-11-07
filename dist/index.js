@@ -3643,7 +3643,7 @@ const extension = (pi) => {
             const restartAuthority = {
                 rootLifecycleGeneration: _rootLifecycleGeneration,
             };
-            void _cmdRoot(ctx, restartAuthority);
+            void _cmdRoot(ctx, restartAuthority, { allowFirstRunWizard: false });
         }
         // Auto-start remote-pi on a fresh boot when the cwd's local config has
         // auto_start_relay enabled (default true). Covers BOTH interactive
@@ -3810,7 +3810,7 @@ const extension = (pi) => {
             _lastCtx = ctx;
             const sub = args.trim();
             if (sub === "") {
-                await _cmdRoot(ctx);
+                await _cmdRoot(ctx, undefined, { allowFirstRunWizard: true });
             }
             else if (sub === "setup") {
                 await _cmdSetup(ctx);
@@ -3879,7 +3879,7 @@ const extension = (pi) => {
                 _cmdUninstall(ctx, { linkCli: true });
             }
             else {
-                await _cmdRoot(ctx);
+                await _cmdRoot(ctx, undefined, { allowFirstRunWizard: true });
             }
         },
     });
@@ -4007,7 +4007,7 @@ async function _cmdPeers(ctx) {
  * `/remote-pi` is intentionally the only command users need day-to-day:
  * idempotent connect + status display.
  */
-async function _cmdRoot(ctx, restartAuthority) {
+async function _cmdRoot(ctx, restartAuthority, options = {}) {
     const rootLifecycleGeneration = restartAuthority?.rootLifecycleGeneration
         ?? _rootLifecycleGeneration;
     if (_cmdRootInFlight) {
@@ -4032,7 +4032,7 @@ async function _cmdRoot(ctx, restartAuthority) {
     }
     if (!_isCurrentRootLifecycle(rootLifecycleGeneration))
         return;
-    const run = _cmdRootInner(ctx, rootLifecycleGeneration);
+    const run = _cmdRootInner(ctx, rootLifecycleGeneration, options.allowFirstRunWizard === true);
     _cmdRootInFlight = run;
     try {
         await run;
@@ -4042,7 +4042,7 @@ async function _cmdRoot(ctx, restartAuthority) {
             _cmdRootInFlight = null;
     }
 }
-async function _cmdRootInner(ctx, rootLifecycleGeneration) {
+async function _cmdRootInner(ctx, rootLifecycleGeneration, allowFirstRunWizard) {
     // A root retains its startup epoch through every pre-candidate await. This is
     // stronger than `_disposed`, which a same-module session_start intentionally
     // clears while an outgoing continuation may still be pending.
@@ -4144,8 +4144,12 @@ async function _cmdRootInner(ctx, rootLifecycleGeneration) {
             return;
         }
     }
-    // First-time wizard: no local config in this cwd → run interactive setup.
+    // First-time wizard: no local config in this cwd → run interactive setup,
+    // but ONLY for an explicit connect. A session boundary (the `/new` rearm
+    // below) must never pop a dialog: a config-less folder just stays idle.
     if (!localConfigExists(cwd)) {
+        if (!allowFirstRunWizard)
+            return;
         const ui = ctx.ui;
         if (typeof ui.select !== "function") {
             _cmdStatus(ctx);

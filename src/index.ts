@@ -2568,6 +2568,16 @@ type RootRestartAuthority = Readonly<{
   rootLifecycleGeneration: number;
 }>;
 
+type RootRunOptions = Readonly<{
+  /**
+   * Allow the first-run setup wizard when this cwd has no local config. Only
+   * an EXPLICIT user command (`/remote-pi`) may ask anything: session
+   * boundaries (a `/new` replacement, a daemon boot) never interrupt the user
+   * with a dialog — a config-less folder stays idle until `/remote-pi` runs.
+   */
+  allowFirstRunWizard?: boolean;
+}>;
+
 function _isCurrentRootLifecycle(generation: number): boolean {
   return !_disposed && generation === _rootLifecycleGeneration;
 }
@@ -4036,7 +4046,7 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
       const restartAuthority: RootRestartAuthority = {
         rootLifecycleGeneration: _rootLifecycleGeneration,
       };
-      void _cmdRoot(ctx, restartAuthority);
+      void _cmdRoot(ctx, restartAuthority, { allowFirstRunWizard: false });
     }
     // Auto-start remote-pi on a fresh boot when the cwd's local config has
     // auto_start_relay enabled (default true). Covers BOTH interactive
@@ -4199,7 +4209,7 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
     handler: async (args, ctx) => {
       _lastCtx = ctx;
       const sub = args.trim();
-      if      (sub === "")                       { await _cmdRoot(ctx); }
+      if      (sub === "")                       { await _cmdRoot(ctx, undefined, { allowFirstRunWizard: true }); }
       else if (sub === "setup")                  { await _cmdSetup(ctx); }
       else if (sub === "status")                 { _cmdStatus(ctx); }
       else if (sub === "stop")                   { await _cmdStop(ctx); }
@@ -4222,7 +4232,7 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
       else if (sub === "cron" || sub.startsWith("cron ")) { await _cmdCron(sub.slice("cron".length).trim(), ctx); }
       else if (sub === "install")                { _cmdInstall(ctx, { linkCli: true }); }
       else if (sub === "uninstall")              { _cmdUninstall(ctx, { linkCli: true }); }
-      else                                       { await _cmdRoot(ctx); }
+      else                                       { await _cmdRoot(ctx, undefined, { allowFirstRunWizard: true }); }
     },
   });
 
@@ -4362,6 +4372,7 @@ async function _cmdPeers(ctx: Pick<ExtensionContext, "ui">): Promise<void> {
 async function _cmdRoot(
   ctx: Pick<ExtensionContext, "ui" | "cwd">,
   restartAuthority?: RootRestartAuthority,
+  options: RootRunOptions = {},
 ): Promise<void> {
   const rootLifecycleGeneration = restartAuthority?.rootLifecycleGeneration
     ?? _rootLifecycleGeneration;
@@ -4385,7 +4396,7 @@ async function _cmdRoot(
 
   if (!_isCurrentRootLifecycle(rootLifecycleGeneration)) return;
 
-  const run = _cmdRootInner(ctx, rootLifecycleGeneration);
+  const run = _cmdRootInner(ctx, rootLifecycleGeneration, options.allowFirstRunWizard === true);
   _cmdRootInFlight = run;
   try {
     await run;
@@ -4397,6 +4408,7 @@ async function _cmdRoot(
 async function _cmdRootInner(
   ctx: Pick<ExtensionContext, "ui" | "cwd">,
   rootLifecycleGeneration: number,
+  allowFirstRunWizard: boolean,
 ): Promise<void> {
   // A root retains its startup epoch through every pre-candidate await. This is
   // stronger than `_disposed`, which a same-module session_start intentionally
@@ -4502,8 +4514,11 @@ async function _cmdRootInner(
     }
   }
 
-  // First-time wizard: no local config in this cwd → run interactive setup.
+  // First-time wizard: no local config in this cwd → run interactive setup,
+  // but ONLY for an explicit connect. A session boundary (the `/new` rearm
+  // below) must never pop a dialog: a config-less folder just stays idle.
   if (!localConfigExists(cwd)) {
+    if (!allowFirstRunWizard) return;
     const ui = ctx.ui as unknown as WizardUI;
     if (typeof ui.select !== "function") {
       _cmdStatus(ctx);
