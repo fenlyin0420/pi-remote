@@ -15,7 +15,7 @@ export type QueuedMessageItem = {
 
 // ── Plan/57 — extension_ui_request bridge (mirror SDK RPC contract) ───────
 // The paired app renders interactive extension prompts (ask_user today, via
-// @eko24ive/pi-ask) natively instead of stranding the mobile user. The wire
+// @fenlyin/pi-ask) natively instead of stranding the mobile user. The wire
 // mirrors the SDK's `pi --mode rpc` extension_ui_request/response contract
 // (RpcExtensionUIRequest/Response in dist/modes/rpc/rpc-types.d.ts) so the
 // mobile app and the Cockpit share one interactive-UI vocabulary. Casing is

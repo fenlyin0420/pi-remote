@@ -29,7 +29,7 @@ document — this README only covers user-facing setup.
 Install the extension (one-time):
 
 ```bash
-pi install git:github.com/fenlyin0420/pi-remote
+pi install npm:@fenlyin/pi-remote
 ```
 
 Then in any Pi terminal:
@@ -220,7 +220,7 @@ messages are unaffected.
 Requirements: Node 20+, Pi (the host coding agent).
 
 ```bash
-pi install git:github.com/fenlyin0420/pi-remote
+pi install npm:@fenlyin/pi-remote
 ```
 
 The extension self-registers the `/remote-pi` slash command and deploys an
@@ -548,7 +548,7 @@ See [`docs/daemon.md`](./docs/daemon.md) for troubleshooting.
 
 ```bash
 # Install the package globally so `remote-pi` and `pi-supervisord`
-# are on your PATH (`pi install git:github.com/fenlyin0420/pi-remote` alone
+# are on your PATH (`pi install npm:@fenlyin/pi-remote` alone
 # extension available but does NOT expose the CLI binaries — see
 # https://docs.npmjs.com/cli/v10/configuring-npm/package-json#bin).
 npm install -g github:fenlyin0420/pi-remote

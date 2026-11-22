@@ -1,13 +1,13 @@
-// Plan/57 — Bridge @eko24ive/pi-ask clarification flows to the paired app over
+// Plan/57 — Bridge @fenlyin/pi-ask clarification flows to the paired app over
 // the extension_ui_request/response contract.
 //
 // pi-ask (when installed) runs ask_user in the Pi TUI on the desktop AND emits
 // a same-process event contract on `pi.events` (docs/remote-events.md):
 //
-//   @eko24ive/pi-ask:started      { flowId, toolCallId?, source, title?, questions[] }
-//   @eko24ive/pi-ask:submit       { requestId, flowId, response }   // we emit this
-//   @eko24ive/pi-ask:submit-result{ requestId, flowId, ok, error? } // pi-ask emits
-//   @eko24ive/pi-ask:completed    { flowId, result }
+//   @fenlyin/pi-ask:started      { flowId, toolCallId?, source, title?, questions[] }
+//   @fenlyin/pi-ask:submit       { requestId, flowId, response }   // we emit this
+//   @fenlyin/pi-ask:submit-result{ requestId, flowId, ok, error? } // pi-ask emits
+//   @fenlyin/pi-ask:completed    { flowId, result }
 //
 // This module subscribes to those events and translates them into the SDK's
 // extension_ui_request/response wire shapes (mirrored from
@@ -16,10 +16,10 @@
 //
 // Inert when pi-ask is absent: no events fire, nothing breaks. ask_user without
 // pi-ask doesn't exist, so this bridge is strictly opt-in.
-const PI_ASK_STARTED = "@eko24ive/pi-ask:started";
-const PI_ASK_COMPLETED = "@eko24ive/pi-ask:completed";
-const PI_ASK_SUBMIT = "@eko24ive/pi-ask:submit";
-const PI_ASK_SUBMIT_RESULT = "@eko24ive/pi-ask:submit-result";
+const PI_ASK_STARTED = "@fenlyin/pi-ask:started";
+const PI_ASK_COMPLETED = "@fenlyin/pi-ask:completed";
+const PI_ASK_SUBMIT = "@fenlyin/pi-ask:submit";
+const PI_ASK_SUBMIT_RESULT = "@fenlyin/pi-ask:submit-result";
 /** Drop a flow from `activeFlows` if pi-ask never resolves it (e.g. a flow
  *  disposed on session_shutdown — pi-ask does not emit `completed` for those).
  *  Bounds memory; generous vs. a human answer time. */

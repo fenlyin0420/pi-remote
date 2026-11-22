@@ -5224,9 +5224,9 @@ describe("session_shutdown teardown", () => {
 
   test("session replacement disposes then rebinds pi-ask bridge listeners", async () => {
     const harness = captureEventHarness();
-    const started = "@eko24ive/pi-ask:started";
-    const completed = "@eko24ive/pi-ask:completed";
-    const submitResult = "@eko24ive/pi-ask:submit-result";
+    const started = "@fenlyin/pi-ask:started";
+    const completed = "@fenlyin/pi-ask:completed";
+    const submitResult = "@fenlyin/pi-ask:submit-result";
 
     expect(harness.busListenerCount(started)).toBe(1);
     expect(harness.busListenerCount(completed)).toBe(1);

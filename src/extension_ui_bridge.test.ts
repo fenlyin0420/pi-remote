@@ -64,7 +64,7 @@ function singleQuestionFlow(overrides: Partial<Record<string, unknown>> = {}) {
   };
 }
 
-const SUBMIT = "@eko24ive/pi-ask:submit";
+const SUBMIT = "@fenlyin/pi-ask:submit";
 
 describe("extension_ui_bridge", () => {
   it("returns null when the SDK exposes no events bus (inert)", () => {
@@ -77,7 +77,7 @@ describe("extension_ui_bridge", () => {
     const sent: ServerMessage[] = [];
     createExtensionUiBridge(fakePi(bus), (m) => sent.push(m));
 
-    bus.emit("@eko24ive/pi-ask:started", singleQuestionFlow());
+    bus.emit("@fenlyin/pi-ask:started", singleQuestionFlow());
 
     expect(sent).toHaveLength(1);
     const req = sent[0];
@@ -174,7 +174,7 @@ describe("extension_ui_bridge", () => {
     const bridge = createExtensionUiBridge(fakePi(bus), (m) => sent.push(m))!;
 
     bus.emit(
-      "@eko24ive/pi-ask:started",
+      "@fenlyin/pi-ask:started",
       singleQuestionFlow({ flowId: "f1", toolCallId: undefined }),
     );
 
@@ -194,9 +194,9 @@ describe("extension_ui_bridge", () => {
     const sent: ServerMessage[] = [];
     createExtensionUiBridge(fakePi(bus), (m) => sent.push(m));
 
-    bus.emit("@eko24ive/pi-ask:started", singleQuestionFlow());
+    bus.emit("@fenlyin/pi-ask:started", singleQuestionFlow());
     sent.length = 0;
-    bus.emit("@eko24ive/pi-ask:completed", { version: 1, flowId: "tool:tc_1" });
+    bus.emit("@fenlyin/pi-ask:completed", { version: 1, flowId: "tool:tc_1" });
 
     expect(sent).toHaveLength(1);
     expect(sent[0]).toMatchObject({
@@ -211,7 +211,7 @@ describe("extension_ui_bridge", () => {
     const sent: ServerMessage[] = [];
     createExtensionUiBridge(fakePi(bus), (m) => sent.push(m));
 
-    bus.emit("@eko24ive/pi-ask:submit-result", {
+    bus.emit("@fenlyin/pi-ask:submit-result", {
       version: 1,
       requestId: "r1",
       flowId: "tool:tc_1",
@@ -237,7 +237,7 @@ describe("extension_ui_bridge", () => {
     const sent: ServerMessage[] = [];
     createExtensionUiBridge(fakePi(bus), (m) => sent.push(m));
 
-    bus.emit("@eko24ive/pi-ask:submit-result", {
+    bus.emit("@fenlyin/pi-ask:submit-result", {
       version: 1,
       requestId: "r1",
       ok: true,
@@ -250,9 +250,9 @@ describe("extension_ui_bridge", () => {
     const sent: ServerMessage[] = [];
     createExtensionUiBridge(fakePi(bus), (m) => sent.push(m));
 
-    bus.emit("@eko24ive/pi-ask:started", { version: 1 }); // no flowId / questions
-    bus.emit("@eko24ive/pi-ask:started", { version: 2, flowId: "x", questions: [] }); // wrong version
-    bus.emit("@eko24ive/pi-ask:started", { version: 1, flowId: "z", questions: [] }); // no questions
+    bus.emit("@fenlyin/pi-ask:started", { version: 1 }); // no flowId / questions
+    bus.emit("@fenlyin/pi-ask:started", { version: 2, flowId: "x", questions: [] }); // wrong version
+    bus.emit("@fenlyin/pi-ask:started", { version: 1, flowId: "z", questions: [] }); // no questions
 
     expect(sent).toHaveLength(0);
   });
@@ -264,7 +264,7 @@ describe("extension_ui_bridge", () => {
     const sent: ServerMessage[] = [];
     const bridge = createExtensionUiBridge(fakePi(bus), (m) => sent.push(m))!;
 
-    bus.emit("@eko24ive/pi-ask:started", {
+    bus.emit("@fenlyin/pi-ask:started", {
       version: 1,
       flowId: "y",
       questions: [{ id: "q", prompt: "Describe the goal", type: "single", required: false, options: [] }],
@@ -292,7 +292,7 @@ describe("extension_ui_bridge", () => {
     const bus = fakeBus();
     const bridge = createExtensionUiBridge(fakePi(bus), () => {})!;
 
-    bus.emit("@eko24ive/pi-ask:started", singleQuestionFlow());
+    bus.emit("@fenlyin/pi-ask:started", singleQuestionFlow());
     bridge.respond({ type: "extension_ui_response", id: "tool:tc_1", cancelled: true });
 
     const submits = bus.emitted.filter((e) => e.name === SUBMIT);
@@ -358,9 +358,9 @@ describe("extension_ui_bridge", () => {
     const sent: ServerMessage[] = [];
     createExtensionUiBridge(fakePi(bus), (m) => sent.push(m));
 
-    bus.emit("@eko24ive/pi-ask:started", singleQuestionFlow());
+    bus.emit("@fenlyin/pi-ask:started", singleQuestionFlow());
     sent.length = 0;
-    bus.emit("@eko24ive/pi-ask:submit-result", {
+    bus.emit("@fenlyin/pi-ask:submit-result", {
       version: 1,
       requestId: "r1",
       ok: false,
@@ -381,7 +381,7 @@ describe("extension_ui_bridge", () => {
     const sent: ServerMessage[] = [];
     createExtensionUiBridge(fakePi(bus), (m) => sent.push(m));
 
-    bus.emit("@eko24ive/pi-ask:submit-result", {
+    bus.emit("@fenlyin/pi-ask:submit-result", {
       version: 1,
       requestId: "r1",
       ok: false,
@@ -398,7 +398,7 @@ describe("extension_ui_bridge", () => {
       const sent: ServerMessage[] = [];
       const bridge = createExtensionUiBridge(fakePi(bus), (m) => sent.push(m))!;
 
-      bus.emit("@eko24ive/pi-ask:started", singleQuestionFlow());
+      bus.emit("@fenlyin/pi-ask:started", singleQuestionFlow());
 
       // What a peer connecting late gets must equal what the live peer got —
       // same id, same envelope — or the app would treat it as a new flow.
@@ -411,12 +411,12 @@ describe("extension_ui_bridge", () => {
 
       expect(bridge.pendingRequests()).toEqual([]);
 
-      bus.emit("@eko24ive/pi-ask:started", singleQuestionFlow());
+      bus.emit("@fenlyin/pi-ask:started", singleQuestionFlow());
       expect(bridge.pendingRequests()).toHaveLength(1);
 
       // A resolved flow must NOT replay — otherwise every later sync would
       // reopen a modal the user already answered.
-      bus.emit("@eko24ive/pi-ask:completed", { version: 1, flowId: "tool:tc_1" });
+      bus.emit("@fenlyin/pi-ask:completed", { version: 1, flowId: "tool:tc_1" });
       expect(bridge.pendingRequests()).toEqual([]);
     });
 
@@ -425,7 +425,7 @@ describe("extension_ui_bridge", () => {
       const bus = fakeBus();
       const bridge = createExtensionUiBridge(fakePi(bus), () => {})!;
 
-      bus.emit("@eko24ive/pi-ask:started", singleQuestionFlow());
+      bus.emit("@fenlyin/pi-ask:started", singleQuestionFlow());
       vi.advanceTimersByTime(10 * 60 * 1000 + 1);
 
       expect(bridge.pendingRequests()).toEqual([]);
@@ -436,9 +436,9 @@ describe("extension_ui_bridge", () => {
       const bus = fakeBus();
       const bridge = createExtensionUiBridge(fakePi(bus), () => {})!;
 
-      bus.emit("@eko24ive/pi-ask:started", singleQuestionFlow());
+      bus.emit("@fenlyin/pi-ask:started", singleQuestionFlow());
       bus.emit(
-        "@eko24ive/pi-ask:started",
+        "@fenlyin/pi-ask:started",
         singleQuestionFlow({ flowId: "tool:tc_2", toolCallId: "tc_2" }),
       );
 
@@ -452,7 +452,7 @@ describe("extension_ui_bridge", () => {
       const bus = fakeBus();
       const bridge = createExtensionUiBridge(fakePi(bus), () => {})!;
 
-      bus.emit("@eko24ive/pi-ask:started", singleQuestionFlow());
+      bus.emit("@fenlyin/pi-ask:started", singleQuestionFlow());
       bridge.pendingRequests();
 
       // The degraded path needs activeFlows to map label→value; a replay that
@@ -478,7 +478,7 @@ describe("extension_ui_bridge", () => {
       const sent: ServerMessage[] = [];
       const bridge = createExtensionUiBridge(fakePi(bus), (m) => sent.push(m))!;
 
-      bus.emit("@eko24ive/pi-ask:started", singleQuestionFlow());
+      bus.emit("@fenlyin/pi-ask:started", singleQuestionFlow());
       sent.length = 0;
 
       vi.advanceTimersByTime(10 * 60 * 1000 + 1);
@@ -502,8 +502,8 @@ describe("extension_ui_bridge", () => {
       const sent: ServerMessage[] = [];
       createExtensionUiBridge(fakePi(bus), (m) => sent.push(m));
 
-      bus.emit("@eko24ive/pi-ask:started", singleQuestionFlow());
-      bus.emit("@eko24ive/pi-ask:completed", { version: 1, flowId: "tool:tc_1" });
+      bus.emit("@fenlyin/pi-ask:started", singleQuestionFlow());
+      bus.emit("@fenlyin/pi-ask:completed", { version: 1, flowId: "tool:tc_1" });
       sent.length = 0;
 
       vi.advanceTimersByTime(10 * 60 * 1000 + 1);

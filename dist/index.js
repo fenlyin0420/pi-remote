@@ -3111,7 +3111,7 @@ const extension = (pi) => {
         return; // this session's pi was already wired
     applied.add(pi);
     _pi = pi;
-    // Plan/57 — bridge @eko24ive/pi-ask clarification flows to the paired app.
+    // Plan/57 — bridge @fenlyin/pi-ask clarification flows to the paired app.
     // Inert when pi-ask isn't installed (no events fire) or the SDK exposes no
     // events bus. ask_user without pi-ask doesn't exist, so this never breaks a
     // Pi that doesn't use the extension. Dispose any prior bridge first so a
