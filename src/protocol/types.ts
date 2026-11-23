@@ -641,16 +641,20 @@ export interface WireCommand {
 /**
  * Plan/59 — one entry of the session picker's catalogue (reply to
  * `session_list`). Mirrors the SDK's `SessionInfo` onto the wire, trimmed
- * to what the app renders: display name (falling back to the first user
- * message), size, last activity and whether this is the session the room
- * is currently on. `id` is the session file's UUID — the app hands it back
- * verbatim on `session_switch`.
+ * to what the app renders: display name (the picker's title, with the
+ * first user message as the fallback), size, last activity and whether
+ * this is the session the room is currently on. `id` is the session file's
+ * UUID — the app hands it back verbatim on `session_switch`.
  */
 export interface WireSession {
   id: string;
-  /** User-set display name; absent when the session never named itself. */
+  /**
+   * The session's own display name (the user's `/name`, the agent's
+   * `setSessionName`, or `--name` at launch); absent when the session
+   * never named itself. The picker's title.
+   */
   name?: string;
-  /** First user message, truncated — the picker's subtitle. */
+  /** First user message, truncated — the picker's fallback title. */
   first_message: string;
   message_count: number;
   /** ISO-8601 of the session file's last write. */
